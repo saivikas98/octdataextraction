@@ -1,126 +1,86 @@
-from io import BytesIO
-from datetime import datetime, timedelta
-import re
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-from pypdf import PdfReader
+from parser_engine import parse_pdf
 
-st.set_page_config(page_title="ANFD Dual-Report Viewer", page_icon="📊", layout="wide")
-ADAM_TAGS=["TICR066","TICR067","TICR034","PICR008","PICR043","PICR032","LSICR007","CP011","CP012","CP007","PT01"]
-ADAM_ROW=re.compile(r"^(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2}:\d{2})\s+((?:-?\d+(?:\.\d+)?\s+){10}-?\d+(?:\.\d+)?)\s+(.*\S)\s*$")
-PROCESS_ROW=re.compile(r"^\s*(\d+)\s+(\d{2}:\d{2}:\d{2})\s+" + r"\s+".join([r"(-?\d+(?:\.\d+)?)"]*8) + r"\s+(.+?)\s*$")
-
-def pdf_text(raw):
-    reader=PdfReader(BytesIO(raw)); pages=[]
-    for page in reader.pages:
-        try: t=page.extract_text(extraction_mode="layout") or ""
-        except TypeError: t=page.extract_text() or ""
-        pages.append(t)
-    return pages
-
-def detect_report(pages):
-    head="\n".join(pages[:3]).upper()
-    if "CYCLE RECORD" in head or "ANFD DRYING CYCLE" in head and "TICR067" in "\n".join(pages[:6]).upper(): return "ADAM drying-cycle report"
-    if "ANFD-2 PROCESS SYSTEM" in head and "FILTER_POS" in "\n".join(pages[:6]).upper(): return "ANFD process-system report"
-    return "Unknown"
-
-def metadata(pages,kind):
-    text="\n".join(pages[:3]); out={"Report type":kind,"Pages":len(pages)}
-    patterns={"Batch number":r"(?:BATCH NUMBER|BATCH NO\.)\s*:?\s*(EK\d+)","Product":r"(?:PRODUCT NAME|BATCH NAME)\s*:?\s*([A-Z][A-Z ]+(?:SUSPENSION)?)","Equipment ID":r"EQUIPMENT ID\s*:?\s*(\d+)","User/Operator":r"(?:USER NAME|OPERATOR NAME)\s*:?\s*([A-Z0-9 ]+)"}
-    for k,p in patterns.items():
-        m=re.search(p,text,re.I); out[k]=m.group(1).strip() if m else "Not detected"
-    return pd.DataFrame(out.items(),columns=["Field","Value"])
-
-def parse_adam(pages):
-    cycle=[]; events=[]; alarms=[]
-    for pn,txt in enumerate(pages,1):
-        for line in txt.splitlines():
-            s=line.strip(); m=ADAM_ROW.match(s)
-            if m:
-                values=[float(x) for x in m.group(3).split()]
-                row=[pd.to_datetime(m.group(1)+" "+m.group(2),dayfirst=True)]+values+[m.group(4).strip(),pn]
-                if "EVENT RECORD" in txt.upper() or pn>=146: events.append(row)
-                else: cycle.append(row)
-            elif "ALARM RECORD" in txt.upper():
-                a=re.match(r"^(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2}:\d{2})\s+(.+)$",s)
-                if a: alarms.append([pd.to_datetime(a.group(1)+" "+a.group(2),dayfirst=True),a.group(3),pn])
-    cols=["Date time"]+ADAM_TAGS+["Stage","Source page"]
-    event_cols=["Date time","TICR066","TICR067","TICR034","PICR008","PICR036","PICR035","LSICR007","CP011","CP012","CP007","PT01","Event","Source page"]
-    return pd.DataFrame(cycle,columns=cols),pd.DataFrame(events,columns=event_cols),pd.DataFrame(alarms,columns=["Date time","Alarm","Source page"])
-
-def parse_process(pages):
-    head="\n".join(pages[:2]); m=re.search(r"START DATE\s*&?TIME.*?(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2}:\d{2})",head,re.I|re.S)
-    if not m: m=re.search(r"(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2}:\d{2})",head)
-    start=pd.to_datetime((m.group(1)+" "+m.group(2)) if m else "12/08/2025 00:00:00",dayfirst=True)
-    rows=[]; day=start.normalize(); previous=None
-    for pn,txt in enumerate(pages,1):
-        for line in txt.splitlines():
-            x=PROCESS_ROW.match(line)
-            if not x: continue
-            tm=datetime.strptime(x.group(2),"%H:%M:%S").time()
-            if previous and tm < previous: day += timedelta(days=1)
-            previous=tm; dt=pd.Timestamp.combine(day.date(),tm)
-            rows.append([int(x.group(1)),dt]+[float(v) for v in x.groups()[2:10]]+[x.group(11).strip(),pn])
-    cols=["Record","Date time","TT-01","TT-02","PT-01","PICR32","TICR066","Filter_Pos","Agit_Rpm","Agit_Pos","Stage","Source page"]
-    alarms=[]
-    for pn,txt in enumerate(pages,1):
-        if "ALARM TABLE" not in txt.upper(): continue
-        for line in txt.splitlines():
-            a=re.match(r"^\s*(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2}:\d{2})\s+(.+?)\s*$",line)
-            if a: alarms.append([pd.to_datetime(a.group(1)+" "+a.group(2),dayfirst=True),a.group(3),pn])
-    return pd.DataFrame(rows,columns=cols),pd.DataFrame(),pd.DataFrame(alarms,columns=["Date time","Alarm","Source page"])
-
+st.set_page_config(page_title="ANFD Dual Report Viewer",page_icon="📊",layout="wide")
 st.title("ANFD Drying Report Viewer")
-st.caption("Supports both ADAM drying-cycle reports and ANFD process-system drying reports. All processing is in memory; no Excel/CSV is created or saved.")
-upload=st.sidebar.file_uploader("Upload either report PDF",type=["pdf"])
-if not upload:
-    st.info("Upload either report type from the sidebar."); st.stop()
-with st.spinner("Detecting report format and extracting records..."):
-    pages=pdf_text(upload.getvalue()); kind=detect_report(pages)
-    if kind=="ADAM drying-cycle report": data,events,alarms=parse_adam(pages)
-    elif kind=="ANFD process-system report": data,events,alarms=parse_process(pages)
-    else: st.error("Unsupported report layout. Expected either the ADAM drying-cycle or ANFD process-system format."); st.stop()
-if data.empty: st.error("The report type was detected, but no process rows were extracted."); st.stop()
-st.sidebar.success(kind)
-d=data.dropna(subset=["Date time"]).sort_values("Date time")
-lo,hi=d["Date time"].min().to_pydatetime(),d["Date time"].max().to_pydatetime()
-window=st.sidebar.slider("Date/time range",lo,hi,(lo,hi),format="DD/MM/YY HH:mm")
-stages=sorted(d["Stage"].dropna().astype(str).unique())
+st.caption("Supports both the ANFD Drying Cycle report and the ADAM Process System drying report. Data is displayed in memory only.")
+files=st.sidebar.file_uploader("Upload one or both PDF reports",type=["pdf"],accept_multiple_files=True)
+if not files:
+    st.info("Upload either report type, or upload both reports together for side-by-side selection. No Excel or CSV file is created.")
+    st.stop()
+
+@st.cache_data(show_spinner=False)
+def load(name,raw,report_choice):
+    return parse_pdf(raw, report_choice)
+
+reports={}
+st.sidebar.subheader("Select report type")
+for i,uploaded in enumerate(files):
+    choice=st.sidebar.selectbox(
+        f"Format for {uploaded.name}",
+        ["Auto-detect","ADAM drying-cycle report","OMCA ANFDA process-system report"],
+        key=f"format_{i}_{uploaded.name}",
+        help="If auto-detect gives an unsupported-layout error, choose the report source manually."
+    )
+    try:
+        with st.spinner(f"Reading {uploaded.name} as {choice}..."):
+            reports[uploaded.name]=load(uploaded.name,uploaded.getvalue(),choice)
+    except Exception as e:
+        st.error(f"{uploaded.name}: {e}")
+if not reports:
+    st.warning("No report could be loaded. Select the correct report type beside each uploaded file.")
+    st.stop()
+
+name=st.sidebar.selectbox("Active report",list(reports))
+r=reports[name]; data=r["Process Data"].copy(); tags=[x for x in r["tags"] if x in data]
+st.sidebar.success(f"Loaded as: {r["report_type"]}")
+
+lo=data["Date time"].min().to_pydatetime(); hi=data["Date time"].max().to_pydatetime()
+window=st.sidebar.slider("Date/time window",lo,hi,(lo,hi),format="DD/MM/YY HH:mm")
+stages=sorted(data["Stage"].dropna().astype(str).unique())
 chosen=st.sidebar.multiselect("Stage",stages,default=stages)
-f=d[d["Date time"].between(pd.Timestamp(window[0]),pd.Timestamp(window[1])) & d["Stage"].astype(str).isin(chosen)]
+f=data[data["Date time"].between(pd.Timestamp(window[0]),pd.Timestamp(window[1])) & data["Stage"].astype(str).isin(chosen)]
 
-c1,c2,c3,c4=st.columns(4)
-c1.metric("Report format",kind.replace(" report","")); c2.metric("Records",f"{len(f):,}")
-c3.metric("Start",f["Date time"].min().strftime("%d %b %H:%M") if len(f) else "-")
-c4.metric("End",f["Date time"].max().strftime("%d %b %H:%M") if len(f) else "-")
+st.subheader(name)
+a,b,c,d=st.columns(4)
+a.metric("Report type",r["report_type"]); b.metric("Rows",f"{len(f):,}")
+c.metric("Start",f["Date time"].min().strftime("%d %b %Y %H:%M") if len(f) else "-")
+d.metric("End",f["Date time"].max().strftime("%d %b %Y %H:%M") if len(f) else "-")
 
-t1,t2,t3,t4,t5=st.tabs(["Overview","Trends","Stages","Events & alarms","All data"])
-with t1:
-    st.subheader("Detected report metadata"); st.dataframe(metadata(pages,kind),hide_index=True,use_container_width=True)
-    numeric=[c for c in f.select_dtypes(include="number").columns if c not in ["Record","Source page"]]
-    defaults=[x for x in (["TICR066","TICR067","TICR034","PT01"] if kind.startswith("ADAM") else ["TT-01","TT-02","TICR066","PT-01"]) if x in numeric]
-    long=f.melt(id_vars="Date time",value_vars=defaults,var_name="Tag",value_name="Value")
-    st.plotly_chart(px.line(long,x="Date time",y="Value",color="Tag",title="Primary process trends"),use_container_width=True)
-with t2:
-    numeric=[c for c in f.select_dtypes(include="number").columns if c not in ["Record","Source page"]]
-    selected=st.multiselect("Select tags",numeric,default=[x for x in numeric[:4]])
+tabs=st.tabs(["Overview","Trends","Stages","Events & alarms","All data","Metadata"])
+with tabs[0]:
+    default=[x for x in ["TICR066","TT-01","TT-02","TICR067","TICR034","PT01","PT-01"] if x in tags]
+    long=f.melt(id_vars="Date time",value_vars=default,var_name="Tag",value_name="Value") if default else pd.DataFrame()
+    if not long.empty: st.plotly_chart(px.line(long,x="Date time",y="Value",color="Tag",title="Key process trends"),use_container_width=True)
+    counts=f["Stage"].value_counts().rename_axis("Stage").reset_index(name="Records")
+    st.plotly_chart(px.bar(counts.head(20),x="Records",y="Stage",orientation="h",title="Records by stage"),use_container_width=True)
+with tabs[1]:
+    selected=st.multiselect("Select process tags",tags,default=default)
     if selected:
         long=f.melt(id_vars="Date time",value_vars=selected,var_name="Tag",value_name="Value")
-        st.plotly_chart(px.line(long,x="Date time",y="Value",color="Tag",title="Selected trends",hover_data={"Value":":.3f"}),use_container_width=True)
-with t3:
+        st.plotly_chart(px.line(long,x="Date time",y="Value",color="Tag",title="Interactive process trends"),use_container_width=True)
+with tabs[2]:
     trans=f.loc[f["Stage"].astype(str).ne(f["Stage"].astype(str).shift()),["Date time","Stage"]].copy()
     trans["Duration to next transition (min)"]=(trans["Date time"].shift(-1)-trans["Date time"]).dt.total_seconds()/60
-    st.dataframe(trans,hide_index=True,use_container_width=True)
-    counts=f["Stage"].value_counts().rename_axis("Stage").reset_index(name="Records")
-    st.plotly_chart(px.bar(counts.head(25),x="Records",y="Stage",orientation="h",title="Stage frequency"),use_container_width=True)
-with t4:
-    a,b=st.columns(2)
-    with a: st.subheader(f"Events ({len(events):,})"); st.dataframe(events,hide_index=True,use_container_width=True)
-    with b: st.subheader(f"Alarms ({len(alarms):,})"); st.dataframe(alarms,hide_index=True,use_container_width=True)
-with t5:
-    q=st.text_input("Search displayed rows")
+    st.dataframe(trans,use_container_width=True,hide_index=True)
+with tabs[3]:
+    col1,col2=st.columns(2)
+    with col1: st.subheader("Events"); st.dataframe(r["Events"],use_container_width=True,hide_index=True)
+    with col2: st.subheader("Alarms"); st.dataframe(r["Alarms"],use_container_width=True,hide_index=True)
+with tabs[4]:
+    search=st.text_input("Search displayed process rows")
     view=f
-    if q: view=view[view.astype(str).apply(lambda c:c.str.contains(q,case=False,na=False)).any(axis=1)]
-    st.dataframe(view,hide_index=True,use_container_width=True,height=650)
-st.caption("Uploaded report data remains in session memory only. This app does not generate or store Excel/CSV files.")
+    if search: view=view[view.astype(str).apply(lambda x:x.str.contains(search,case=False,na=False)).any(axis=1)]
+    st.dataframe(view,use_container_width=True,hide_index=True,height=650)
+with tabs[5]: st.dataframe(r["Metadata"],use_container_width=True,hide_index=True)
+
+if len(reports)>1:
+    st.divider(); st.subheader("Uploaded report comparison")
+    comparison=[]
+    for n,x in reports.items():
+        q=x["Process Data"]
+        comparison.append({"File":n,"Report type":x["report_type"],"Rows":len(q),"Start":q["Date time"].min(),"End":q["Date time"].max(),"Alarms":len(x["Alarms"]),"Events":len(x["Events"])})
+    st.dataframe(pd.DataFrame(comparison),use_container_width=True,hide_index=True)
+st.caption("Privacy mode: PDFs are parsed in memory for the active Streamlit session. The app does not create or save Excel/CSV files.")
