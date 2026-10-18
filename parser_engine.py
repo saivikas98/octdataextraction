@@ -108,3 +108,4 @@ def parse_pdf(raw, report_choice="Auto-detect"):
     result["selected_format"]=report_choice
     result["detected_format"]=detected
     return result
+
