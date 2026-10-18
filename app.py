@@ -5,31 +5,31 @@ from parser_engine import parse_pdf
 
 st.set_page_config(page_title="ANFD Dual Report Viewer",page_icon="📊",layout="wide")
 
-def display_table(df, key, height=520, page_size=500):
-    """Render large tables safely and show dates as DD/MM/YYYY HH:MM:SS."""
+def display_table(df, key, height=700, page_size=None):
+    """Render the complete dataset as one combined table without pagination."""
     view = df.copy().reset_index(drop=True)
-    total = len(view)
-    if total == 0:
+    if view.empty:
         st.info("No records available for the selected filters.")
         return
-    pages = max(1, (total + page_size - 1) // page_size)
-    page = st.number_input(
-        "Table page",
-        min_value=1,
-        max_value=pages,
-        value=1,
-        step=1,
-        key=f"page_{key}",
-    ) if pages > 1 else 1
-    start = (int(page) - 1) * page_size
-    page_df = view.iloc[start:start + page_size].copy()
-    for col in page_df.columns:
-        if pd.api.types.is_datetime64_any_dtype(page_df[col]):
-            page_df[col] = page_df[col].dt.strftime("%d/%m/%Y %H:%M:%S")
-        elif page_df[col].dtype == "object":
-            page_df[col] = page_df[col].fillna("").astype(str)
-    st.caption(f"Showing rows {start + 1:,} to {start + len(page_df):,} of {total:,}")
-    st.dataframe(page_df, use_container_width=True, hide_index=True, height=height)
+
+    # Convert values to Arrow-safe display types before Streamlit creates cells.
+    for col in view.columns:
+        if pd.api.types.is_datetime64_any_dtype(view[col]):
+            view[col] = view[col].dt.strftime("%d/%m/%Y %H:%M:%S").fillna("")
+        elif pd.api.types.is_numeric_dtype(view[col]):
+            view[col] = pd.to_numeric(view[col], errors="coerce")
+        else:
+            view[col] = view[col].fillna("").astype(str)
+
+    st.caption(f"Combined table: all {len(view):,} records shown in one table. Scroll vertically to view every row.")
+    st.dataframe(
+        view,
+        use_container_width=True,
+        hide_index=True,
+        height=height,
+        row_height=32,
+        key=f"combined_{key}",
+    )
 
 st.title("ANFD Drying Report Viewer")
 st.caption("Supports both the ANFD Drying Cycle report and the ADAM Process System drying report. Data is displayed in memory only.")
