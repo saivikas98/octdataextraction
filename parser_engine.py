@@ -3,7 +3,10 @@ from datetime import datetime, timedelta
 import re
 import pandas as pd
 from pypdf import PdfReader
-import pdfplumber
+try:
+    import pdfplumber
+except ModuleNotFoundError:
+    pdfplumber = None
 
 TYPE1_TAGS=["TICR066","TICR067","TICR034","PICR008","PICR043","PICR032","LSICR007","CP011","CP012","CP007","PT01"]
 TYPE2_TAGS=["TT-01","TT-02","PT-01","PICR32","TICR066","Filter_Pos","Agit_Rpm","Agit_Pos"]
@@ -16,6 +19,8 @@ def pages_from_pdf(raw):
     use_layout = "ANFD DRYING CYCLE" in probe and "CYCLE RECORD" in probe
     kind = "ANFD Drying Cycle report" if use_layout else ("ADAM Process System report" if "ANFD-2 PROCESS SYSTEM" in probe and "FILTER_POS" in probe else "Unknown report")
     if use_layout:
+        if pdfplumber is None:
+            raise RuntimeError("The pdfplumber package is not installed. Ensure requirements.txt is in the same GitHub folder as app.py, then reboot the Streamlit app.")
         with pdfplumber.open(BytesIO(raw)) as pdf:
             pages=[p.extract_text(layout=True) or "" for p in pdf.pages]
     else:
