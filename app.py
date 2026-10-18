@@ -31,6 +31,16 @@ def display_table(df, key, height=700, page_size=None):
         key=f"combined_{key}",
     )
 
+def chart_data(df, max_points=2500):
+    """Keep the full table while limiting only chart points for browser stability."""
+    if len(df) <= max_points:
+        return df
+    step = max(1, len(df) // max_points)
+    sampled = df.iloc[::step].copy()
+    if sampled.index[-1] != df.index[-1]:
+        sampled = pd.concat([sampled, df.iloc[[-1]]])
+    return sampled
+
 st.title("ANFD Drying Report Viewer")
 st.caption("Supports both the ANFD Drying Cycle report and the ADAM Process System drying report. Data is displayed in memory only.")
 files=st.sidebar.file_uploader("Upload one or both PDF reports",type=["pdf"],accept_multiple_files=True)
@@ -76,17 +86,29 @@ a.metric("Report type",r["report_type"]); b.metric("Rows",f"{len(f):,}")
 c.metric("Start",f["Date time"].min().strftime("%d %b %Y %H:%M") if len(f) else "-")
 d.metric("End",f["Date time"].max().strftime("%d %b %Y %H:%M") if len(f) else "-")
 
+# Extraction continuity check. The table remains complete; only plots may be sampled.
+ordered=data.sort_values("Date time").reset_index(drop=True)
+gaps=ordered["Date time"].diff().dt.total_seconds().div(60)
+large_gaps=int((gaps > 2.1).sum())
+st.caption(
+    f"Extraction check: first record {ordered['Date time'].min().strftime('%d/%m/%Y %H:%M:%S')} | "
+    f"last record {ordered['Date time'].max().strftime('%d/%m/%Y %H:%M:%S')} | "
+    f"{len(ordered):,} total rows | {large_gaps} intervals longer than 2.1 minutes."
+)
+
 tabs=st.tabs(["Overview","Trends","Stages","Events & alarms","All data","Metadata"])
 with tabs[0]:
     default=[x for x in ["TICR066","TT-01","TT-02","TICR067","TICR034","PT01","PT-01"] if x in tags]
-    long=f.melt(id_vars="Date time",value_vars=default,var_name="Tag",value_name="Value") if default else pd.DataFrame()
+    plot_df=chart_data(f)
+    long=plot_df.melt(id_vars="Date time",value_vars=default,var_name="Tag",value_name="Value") if default else pd.DataFrame()
     if not long.empty: st.plotly_chart(px.line(long,x="Date time",y="Value",color="Tag",title="Key process trends"),use_container_width=True)
     counts=f["Stage"].value_counts().rename_axis("Stage").reset_index(name="Records")
     st.plotly_chart(px.bar(counts.head(20),x="Records",y="Stage",orientation="h",title="Records by stage"),use_container_width=True)
 with tabs[1]:
     selected=st.multiselect("Select process tags",tags,default=default)
     if selected:
-        long=f.melt(id_vars="Date time",value_vars=selected,var_name="Tag",value_name="Value")
+        plot_df=chart_data(f)
+        long=plot_df.melt(id_vars="Date time",value_vars=selected,var_name="Tag",value_name="Value")
         st.plotly_chart(px.line(long,x="Date time",y="Value",color="Tag",title="Interactive process trends"),use_container_width=True)
 with tabs[2]:
     trans=f.loc[f["Stage"].astype(str).ne(f["Stage"].astype(str).shift()),["Date time","Stage"]].copy()
