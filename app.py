@@ -4,6 +4,33 @@ import streamlit as st
 from parser_engine import parse_pdf
 
 st.set_page_config(page_title="ANFD Dual Report Viewer",page_icon="📊",layout="wide")
+
+def display_table(df, key, height=520, page_size=500):
+    """Render large tables safely and show dates as DD/MM/YYYY HH:MM:SS."""
+    view = df.copy().reset_index(drop=True)
+    total = len(view)
+    if total == 0:
+        st.info("No records available for the selected filters.")
+        return
+    pages = max(1, (total + page_size - 1) // page_size)
+    page = st.number_input(
+        "Table page",
+        min_value=1,
+        max_value=pages,
+        value=1,
+        step=1,
+        key=f"page_{key}",
+    ) if pages > 1 else 1
+    start = (int(page) - 1) * page_size
+    page_df = view.iloc[start:start + page_size].copy()
+    for col in page_df.columns:
+        if pd.api.types.is_datetime64_any_dtype(page_df[col]):
+            page_df[col] = page_df[col].dt.strftime("%d/%m/%Y %H:%M:%S")
+        elif page_df[col].dtype == "object":
+            page_df[col] = page_df[col].fillna("").astype(str)
+    st.caption(f"Showing rows {start + 1:,} to {start + len(page_df):,} of {total:,}")
+    st.dataframe(page_df, use_container_width=True, hide_index=True, height=height)
+
 st.title("ANFD Drying Report Viewer")
 st.caption("Supports both the ANFD Drying Cycle report and the ADAM Process System drying report. Data is displayed in memory only.")
 files=st.sidebar.file_uploader("Upload one or both PDF reports",type=["pdf"],accept_multiple_files=True)
@@ -64,17 +91,17 @@ with tabs[1]:
 with tabs[2]:
     trans=f.loc[f["Stage"].astype(str).ne(f["Stage"].astype(str).shift()),["Date time","Stage"]].copy()
     trans["Duration to next transition (min)"]=(trans["Date time"].shift(-1)-trans["Date time"]).dt.total_seconds()/60
-    st.dataframe(trans,use_container_width=True,hide_index=True)
+    display_table(trans, "transitions", height=520, page_size=300)
 with tabs[3]:
     col1,col2=st.columns(2)
-    with col1: st.subheader("Events"); st.dataframe(r["Events"],use_container_width=True,hide_index=True)
-    with col2: st.subheader("Alarms"); st.dataframe(r["Alarms"],use_container_width=True,hide_index=True)
+    with col1: st.subheader("Events"); display_table(r["Events"], "events", height=520, page_size=300)
+    with col2: st.subheader("Alarms"); display_table(r["Alarms"], "alarms", height=520, page_size=300)
 with tabs[4]:
     search=st.text_input("Search displayed process rows")
     view=f
     if search: view=view[view.astype(str).apply(lambda x:x.str.contains(search,case=False,na=False)).any(axis=1)]
-    st.dataframe(view,use_container_width=True,hide_index=True,height=650)
-with tabs[5]: st.dataframe(r["Metadata"],use_container_width=True,hide_index=True)
+    display_table(view, "all_data", height=650, page_size=500)
+with tabs[5]: display_table(r["Metadata"], "metadata", height=420, page_size=100)
 
 if len(reports)>1:
     st.divider(); st.subheader("Uploaded report comparison")
@@ -82,5 +109,5 @@ if len(reports)>1:
     for n,x in reports.items():
         q=x["Process Data"]
         comparison.append({"File":n,"Report type":x["report_type"],"Rows":len(q),"Start":q["Date time"].min(),"End":q["Date time"].max(),"Alarms":len(x["Alarms"]),"Events":len(x["Events"])})
-    st.dataframe(pd.DataFrame(comparison),use_container_width=True,hide_index=True)
+    display_table(pd.DataFrame(comparison), "comparison", height=300, page_size=100)
 st.caption("Privacy mode: PDFs are parsed in memory for the active Streamlit session. The app does not create or save Excel/CSV files.")
