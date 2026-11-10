@@ -10,6 +10,7 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 import pdfplumber
+from pathlib import Path
 
 
 def clear_application_cache():
