@@ -283,56 +283,33 @@ def infer_destination(status):
         if token in u and name not in hits: hits.append(name)
     return " -> ".join(hits[-2:]) if hits else "Destination not explicit in step status"
 
-def calculate_transfer_flowrates(long_df, min_duration_min=2.0, min_weight_change_kg=0.25, smoothing_points=3):
-    """Estimate mass-transfer rate from sustained vessel weight change.
-
-    Flow = -d(weight)/dt for source-vessel discharge and +d(weight)/dt for receiving-vessel charge.
-    Short spikes are excluded using duration and total-weight-change thresholds.
-    """
+def calculate_interval_flowrates(long_df, smoothing_points=3):
+    """Calculate mass flow for each consecutive valid load-cell interval, without averaging."""
     if long_df is None or long_df.empty:
-        return pd.DataFrame(),pd.DataFrame()
-    load=long_df[long_df["Instrument tag"].isin(FLOW_SOURCE_TAGS)].copy()
-    if load.empty:
-        return pd.DataFrame(),pd.DataFrame()
-    point_parts=[]; episode_rows=[]
-    for (source_report,tag),g in load.groupby(["Source report","Instrument tag"],dropna=False) if "Source report" in load.columns else load.assign(**{"Source report":"Active report"}).groupby(["Source report","Instrument tag"]):
+        return pd.DataFrame()
+    work=long_df[long_df["Instrument tag"].isin(FLOW_SOURCE_TAGS)].copy()
+    if work.empty:
+        return pd.DataFrame()
+    parts=[]
+    group_cols=["Source report","Instrument tag"] if "Source report" in work.columns else ["Instrument tag"]
+    for _,g in work.groupby(group_cols,dropna=False,observed=True):
         g=g.sort_values("Date time").drop_duplicates("Date time").copy()
-        g["Smoothed weight (kg)"]=g["Value"].rolling(max(1,int(smoothing_points)),center=True,min_periods=1).median()
-        g["Interval (min)"]=g["Date time"].diff().dt.total_seconds().div(60)
-        g["Weight change (kg)"]=g["Smoothed weight (kg)"].diff()
-        g["Signed flow (kg/min)"]=g["Weight change (kg)"].div(g["Interval (min)"])
-        g.loc[(g["Interval (min)"]<=0)|(g["Interval (min)"]>5),"Signed flow (kg/min)"]=pd.NA
-        g["Transfer direction"]=g["Signed flow (kg/min)"].apply(lambda x:"Receiving / charging" if pd.notna(x) and x>0 else ("Source / discharging" if pd.notna(x) and x<0 else "No measurable transfer"))
-        g["Transfer flowrate (kg/min)"]=g["Signed flow (kg/min)"].abs()
-        g["Transfer flowrate (kg/h)"]=g["Transfer flowrate (kg/min)"]*60
-        g["Source vessel"]=FLOW_SOURCE_TAGS[tag]
+        g["Raw weight (kg)"]=pd.to_numeric(g["Value"],errors="coerce")
+        g["Smoothed weight (kg)"]=g["Raw weight (kg)"].rolling(max(1,int(smoothing_points)),center=True,min_periods=1).median()
+        g["Previous time"]=g["Date time"].shift()
+        g["Previous weight (kg)"]=g["Smoothed weight (kg)"].shift()
+        g["Interval (min)"]=(g["Date time"]-g["Previous time"]).dt.total_seconds()/60
+        g["Weight change (kg)"]=g["Smoothed weight (kg)"]-g["Previous weight (kg)"]
+        g["Signed flow (kg/min)"]=g["Weight change (kg)"]/g["Interval (min)"]
+        invalid=g["Interval (min)"].isna()|(g["Interval (min)"]<=0)|(g["Interval (min)"]>5)
+        g.loc[invalid,"Signed flow (kg/min)"]=pd.NA
+        g["Flowrate (kg/min)"]=g["Signed flow (kg/min)"].abs()
+        g["Flowrate (kg/h)"]=g["Flowrate (kg/min)"]*60
+        g["Transfer direction"]=g["Signed flow (kg/min)"].apply(lambda x:"Receiving / charging" if pd.notna(x) and x>0 else ("Source / discharging" if pd.notna(x) and x<0 else "No measurable change"))
+        g["Vessel"]=g["Instrument tag"].astype(str).map(FLOW_SOURCE_TAGS)
         g["Destination / route"]=g["Step status"].map(infer_destination)
-        active=g["Signed flow (kg/min)"].abs().ge(0.02) & g["Signed flow (kg/min)"].notna()
-        # Split episodes when direction, activity, status, or time continuity changes.
-        direction=g["Signed flow (kg/min)"].apply(lambda x:1 if pd.notna(x) and x>0 else (-1 if pd.notna(x) and x<0 else 0))
-        split=(active.ne(active.shift())|direction.ne(direction.shift())|g["Step status"].ne(g["Step status"].shift())|g["Interval (min)"].gt(5)).cumsum()
-        g["Transfer episode"]=split
-        point_parts.append(g)
-        for episode,ep in g[active].groupby("Transfer episode"):
-            if ep.empty: continue
-            start=ep.iloc[0]["Date time"]-pd.to_timedelta(float(ep.iloc[0]["Interval (min)"] or 0),unit="m")
-            end=ep.iloc[-1]["Date time"]
-            duration=(end-start).total_seconds()/60
-            weight_change=ep["Weight change (kg)"].sum()
-            if duration < float(min_duration_min) or abs(weight_change) < float(min_weight_change_kg): continue
-            avg=abs(weight_change)/duration
-            episode_rows.append({
-                "Source report":source_report,"Instrument tag":tag,"Vessel":FLOW_SOURCE_TAGS[tag],
-                "Direction":"Receiving / charging" if weight_change>0 else "Source / discharging",
-                "Destination / route":infer_destination(" ".join(ep["Step status"].astype(str).unique())),
-                "Start":start,"End":end,"Duration (min)":duration,"Net weight change (kg)":weight_change,
-                "Average flow (kg/min)":avg,"Average flow (kg/h)":avg*60,
-                "Peak interval flow (kg/min)":ep["Transfer flowrate (kg/min)"].max(),
-                "Step status":" | ".join(ep["Step status"].astype(str).unique()),
-            })
-    points=pd.concat(point_parts,ignore_index=True) if point_parts else pd.DataFrame()
-    episodes=pd.DataFrame(episode_rows).sort_values(["Source report","Start"]) if episode_rows else pd.DataFrame()
-    return points,episodes
+        parts.append(g)
+    return pd.concat(parts,ignore_index=True) if parts else pd.DataFrame()
 
 def add_hmi_tag_names(df):
     """Add HMI names without tuple mapping or MultiIndex construction."""
@@ -736,10 +713,8 @@ report_names=[r["file_name"] for r in valid]
 active_name=st.sidebar.selectbox("Active report",report_names)
 r=next(x for x in valid if x["file_name"]==active_name)
 long_df=r["long_df"]; groups=r["groups"]; events=r["events"]; alarms=r["alarms"]; meta=r["meta"]; tag_inventory=r.get("tag_inventory",pd.DataFrame())
-flow_min_duration=st.sidebar.number_input("Minimum transfer duration (min)",min_value=1.0,max_value=30.0,value=2.0,step=1.0,key=f"flow_duration_{active_name}")
-flow_min_change=st.sidebar.number_input("Minimum net weight change (kg)",min_value=0.05,max_value=20.0,value=0.25,step=0.05,key=f"flow_change_{active_name}")
-flow_smoothing=st.sidebar.select_slider("Weight smoothing points",options=[1,3,5,7],value=3,key=f"flow_smoothing_{active_name}")
-flow_points,flow_episodes=calculate_transfer_flowrates(long_df,flow_min_duration,flow_min_change,flow_smoothing)
+flow_smoothing=st.sidebar.select_slider("Flowrate weight smoothing points",options=[1,3,5,7],value=3,key=f"flow_smoothing_{active_name}")
+flow_points=calculate_interval_flowrates(long_df,flow_smoothing)
 st.sidebar.success(f"Processing as: {r['detected_type']}")
 
 combine_same_type=st.sidebar.checkbox("Combine all processed reports",value=False)
@@ -815,21 +790,32 @@ with tabs[2]:
     else:
         safe_table(tag_inventory.sort_values(["Extraction status","Canonical tag"]),height=650,max_rows=10000,key="tag_audit")
 with tabs[3]:
-    st.subheader("Calculated material-transfer flowrate from vessel weight")
-    st.caption("Mass flow is estimated from the slope of LSICR vessel weight: |Δweight| / Δtime. Negative slope is discharge; positive slope is receiving/charging. Results are mass flow only, not volumetric flow.")
-    if flow_episodes.empty:
-        st.info("No sustained weight-transfer episodes met the selected duration and weight-change thresholds.")
+    st.subheader("Interval-by-interval material-transfer flowrate")
+    st.caption("Flowrate is calculated at every consecutive sampling interval. No average or transfer-episode aggregation is applied.")
+    if flow_points.empty:
+        st.info("No load-cell data is available for interval flowrate calculation.")
     else:
-        source_tags=sorted(flow_episodes["Instrument tag"].unique())
-        flow_tag=st.selectbox("Load-cell tag",source_tags,key="flow_tag")
-        episode_view=flow_episodes[flow_episodes["Instrument tag"]==flow_tag].copy()
-        safe_table(episode_view,height=520)
-        point_view=flow_points[(flow_points["Instrument tag"]==flow_tag)&flow_points["Transfer flowrate (kg/min)"].notna()].copy()
-        if not point_view.empty:
-            plot=point_view.iloc[::max(1,len(point_view)//3000)]
-            fig=px.line(plot,x="Date time",y="Transfer flowrate (kg/min)",color="Transfer direction",title=f"Calculated transfer flowrate: {flow_tag}")
+        flow_tags=sorted(flow_points["Instrument tag"].astype(str).unique())
+        flow_tag=st.selectbox("Load-cell tag",flow_tags,key=f"flow_tag_{active_name}")
+        flow_tag_data=flow_points[flow_points["Instrument tag"].astype(str)==str(flow_tag)].copy()
+        flow_steps=sorted(x for x in flow_tag_data["Step status"].dropna().astype(str).unique() if x.strip())
+        flow_step=st.selectbox("Step name",["All steps"]+flow_steps,key=f"flow_step_{active_name}_{flow_tag}")
+        if flow_step!="All steps":
+            flow_tag_data=flow_tag_data[flow_tag_data["Step status"].astype(str)==flow_step]
+        measurable=flow_tag_data[flow_tag_data["Flowrate (kg/min)"].notna()].copy()
+        c1,c2,c3=st.columns(3)
+        c1.metric("Valid intervals",f"{len(measurable):,}")
+        c2.metric("Selected step",flow_step)
+        c3.metric("Load-cell tag",flow_tag)
+        if measurable.empty:
+            st.info("No valid consecutive intervals are available for the selected step.")
+        else:
+            plot=measurable.iloc[::max(1,len(measurable)//3000)]
+            fig=px.line(plot,x="Date time",y="Flowrate (kg/min)",color="Transfer direction",markers=True,title=f"Interval flowrate: {flow_tag} | {flow_step}")
             st.plotly_chart(fig,use_container_width=True)
-            safe_table(point_view[["Date time","Instrument tag","Source vessel","Destination / route","Smoothed weight (kg)","Weight change (kg)","Interval (min)","Transfer direction","Transfer flowrate (kg/min)","Transfer flowrate (kg/h)","Step status"]],height=620)
+            cols=["Previous time","Date time","Instrument tag","Vessel","Destination / route","Previous weight (kg)","Smoothed weight (kg)","Weight change (kg)","Interval (min)","Signed flow (kg/min)","Flowrate (kg/min)","Flowrate (kg/h)","Transfer direction","Step status","Source page"]
+            safe_table(measurable[cols],height=650,max_rows=max(3000,len(measurable)),key=f"interval_flow_{active_name}_{flow_tag}_{flow_step}")
+
 with tabs[4]:
     mapping=long_df[["Instrument tag","HMI equipment","HMI measurement name","Unit"]].drop_duplicates().sort_values(["HMI equipment","Instrument tag"])
     safe_table(mapping,height=650)
