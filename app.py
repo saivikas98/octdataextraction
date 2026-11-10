@@ -311,19 +311,35 @@ def calculate_transfer_flowrates(long_df, min_duration_min=2.0, min_weight_chang
     return points,episodes
 
 def add_hmi_tag_names(df):
-    """Add HMI equipment and measurement names while preserving the raw report tag."""
+    """Add HMI names without tuple mapping or MultiIndex construction."""
     if df is None or df.empty or "Instrument tag" not in df.columns:
         return df
     out=df.copy()
-    def details(tag):
-        equipment, measurement, default_unit=HMI_TAG_MAP.get(str(tag),("Not mapped from supplied HMI screens",f"Instrument tag {tag}",""))
-        return equipment,measurement,default_unit
-    detail=out["Instrument tag"].map(details)
-    out["HMI equipment"]=detail.map(lambda x:x[0])
-    out["HMI measurement name"]=detail.map(lambda x:x[1])
+
+    # Convert categorical tags to ordinary strings before mapping. Mapping a
+    # categorical Series to tuples can create a pandas MultiIndex and trigger
+    # "isna is not defined for MultiIndex" on Streamlit Cloud.
+    tags=out["Instrument tag"].astype("string").fillna("")
+    equipment_map={tag:values[0] for tag,values in HMI_TAG_MAP.items()}
+    measurement_map={tag:values[1] for tag,values in HMI_TAG_MAP.items()}
+    unit_map={tag:values[2] for tag,values in HMI_TAG_MAP.items()}
+
+    out["Instrument tag"]=tags.astype(str)
+    out["HMI equipment"]=tags.map(equipment_map).fillna("Not mapped from supplied HMI screens").astype(str)
+    fallback_measurement="Instrument tag "+tags.astype(str)
+    mapped_measurement=tags.map(measurement_map)
+    out["HMI measurement name"]=mapped_measurement.where(mapped_measurement.notna(),fallback_measurement).astype(str)
+
     if "Unit" in out.columns:
-        out["Unit"]=out.apply(lambda r: r["Unit"] if str(r["Unit"]).strip() else details(r["Instrument tag"])[2],axis=1)
-    out["HMI display label"]=out.apply(lambda r:f"{r['Instrument tag']} | {r['HMI equipment']} | {r['HMI measurement name']}",axis=1)
+        existing=out["Unit"].astype("string").fillna("").str.strip()
+        defaults=tags.map(unit_map).fillna("").astype(str)
+        out["Unit"]=existing.where(existing.ne(""),defaults).astype(str)
+
+    out["HMI display label"]=(
+        out["Instrument tag"].astype(str)+" | "+
+        out["HMI equipment"].astype(str)+" | "+
+        out["HMI measurement name"].astype(str)
+    )
     return out
 
 def extract_pdf_pages(raw: bytes):
@@ -480,6 +496,11 @@ def parse_omca_anfd_report(pages):
     return groups,long_df,pd.DataFrame(),pd.DataFrame(alarms)
 
 def safe_table(df,height=650,max_rows=3000,key=None):
+    df=df.copy()
+    if isinstance(df.index,pd.MultiIndex):
+        df=df.reset_index()
+    if isinstance(df.columns,pd.MultiIndex):
+        df.columns=[" | ".join(str(x) for x in col if str(x)!="") if isinstance(col,tuple) else str(col) for col in df.columns]
     total=len(df)
     if total>max_rows:
         st.caption(f"Displaying the first {max_rows:,} of {total:,} rows for browser stability. Calculations use all rows.")
@@ -547,7 +568,8 @@ def process_uploaded_report(file_name, raw, selected_type):
         long_df["Value"]=pd.to_numeric(long_df["Value"],errors="coerce",downcast="float")
         long_df["Source page"]=pd.to_numeric(long_df["Source page"],errors="coerce",downcast="integer")
         for c in ["Source report","Instrument tag","Unit","Step status","Instrument group"]:
-            if c in long_df: long_df[c]=long_df[c].astype("category")
+            if c in long_df:
+                long_df[c]=long_df[c].astype("string").fillna("")
     long_df=add_hmi_tag_names(long_df)
     pages.clear()
     return {
@@ -632,7 +654,8 @@ m1,m2,m3,m4=st.columns(4)
 m1.metric("Uploaded reports",len(uploads)); m2.metric("Processed reports",len(valid))
 m3.metric("Active report tags",len(tags)); m4.metric("Active tag readings",f"{len(tag_df):,}")
 
-summary=long_df.groupby(["Instrument tag","HMI equipment","HMI measurement name","Unit"],dropna=False).agg(Records=("Value","size"),Start=("Date time","min"),End=("Date time","max"),Minimum=("Value","min"),Maximum=("Value","max"),Mean=("Value","mean")).reset_index()
+summary=(long_df.groupby(["Instrument tag","HMI equipment","HMI measurement name","Unit"],dropna=False,observed=True,as_index=False)
+    .agg(Records=("Value","size"),Start=("Date time","min"),End=("Date time","max"),Minimum=("Value","min"),Maximum=("Value","max"),Mean=("Value","mean")))
 
 tabs=st.tabs(["Selected tag","Tag summary","Transfer flowrate","HMI tag dictionary","Instrument groups","All tagwise data","Events & alarms","Metadata"])
 with tabs[0]:
