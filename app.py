@@ -1,5 +1,9 @@
 from io import BytesIO
 from datetime import datetime, timedelta
+import os
+import subprocess
+import tempfile
+import time
 import gc
 import re
 import pandas as pd
@@ -13,7 +17,7 @@ def clear_application_cache():
     st.cache_data.clear()
     st.cache_resource.clear()
     for key in list(st.session_state.keys()):
-        if key.startswith(("report_type_", "combined_", "flow_", "page_")):
+        if key=="processed_reports" or key.startswith(("report_type_", "combined_", "flow_", "page_")):
             del st.session_state[key]
     st.session_state["cache_cleared_notice"] = True
 
@@ -29,6 +33,7 @@ st.sidebar.caption("Use after updating app.py, changing report type, or seeing a
 DATE_RE = re.compile(r"^(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2}:\d{2})\s+(.+)$")
 NUMBER_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
 TAG_RE = re.compile(r"^(?:LSICR|PICR|TICR|TA|TLP|RLS|CP|PT|TT|XV|DP|QI?CR|CI?CR|MFM)[A-Z0-9_-]*$", re.I)
+TAG_TOKEN_RE = re.compile(r"(?:LSICR|PICR|TICR|TA|TLP|RLS|CP|PT|TT|XV|DP|QICR|CICR|MFM)[A-Z0-9_-]*", re.I)
 
 
 # HMI tag naming derived from the supplied Octreotide Skid HMI screens.
@@ -361,8 +366,32 @@ def add_hmi_tag_names(df):
     return out
 
 def extract_pdf_pages(raw: bytes):
+    """Fast PDF text extraction using Poppler, with pdfplumber fallback."""
+    started=time.perf_counter()
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf_path=os.path.join(tmp,"input.pdf")
+            txt_path=os.path.join(tmp,"output.txt")
+            with open(pdf_path,"wb") as f:
+                f.write(raw)
+            completed=subprocess.run(
+                ["pdftotext","-layout","-enc","UTF-8",pdf_path,txt_path],
+                stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,
+                timeout=180,check=False,
+            )
+            if completed.returncode==0 and os.path.exists(txt_path):
+                text=Path(txt_path).read_text(encoding="utf-8",errors="replace")
+                pages=text.split("\f")
+                if pages and not pages[-1].strip(): pages=pages[:-1]
+                if any(x.strip() for x in pages):
+                    return pages,"Poppler pdftotext",time.perf_counter()-started
+    except (FileNotFoundError,subprocess.TimeoutExpired,OSError):
+        pass
+
+    # Portable fallback when Poppler is unavailable.
     with pdfplumber.open(BytesIO(raw)) as pdf:
-        return [page.extract_text(layout=True) or "" for page in pdf.pages]
+        pages=[page.extract_text(layout=True) or "" for page in pdf.pages]
+    return pages,"pdfplumber fallback",time.perf_counter()-started
 
 def clean_text(value):
     return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", str(value or "")).strip()
@@ -420,28 +449,35 @@ def scan_report_tag_headers(pages):
     return pd.DataFrame(found).drop_duplicates() if found else pd.DataFrame(columns=["Raw report tag","Canonical tag","Section","Header page"])
 
 def header_tags(page_text):
+    """Extract every tag token from the current page header without relying on spacing."""
     lines=page_text.splitlines()
     tags=[]; units={}; record_type=None
     for line in lines:
-        u=line.upper()
-        if "CYCLE RECORD" in u: record_type="Cycle"
-        if "EVENT RECORD" in u: record_type="Event"
-        if "DATE TIME" in u and ("STEP STATUS" in u or "EVENT STATUS" in u):
-            right=re.split(r"DATE TIME", line, flags=re.I, maxsplit=1)[1]
-            right=re.sub(r"(?:STEP|EVENT) STATUS.*$", "", right, flags=re.I)
-            candidates=[x.strip() for x in re.split(r"\s{2,}", right) if x.strip()]
-            tags=[canonical_tag(x) for x in candidates if TAG_RE.match(x)]
-            break
-    # Prefer the explicit Tag row, which is authoritative.
+        upper=line.upper()
+        if "CYCLE RECORD" in upper: record_type="Cycle"
+        if "EVENT RECORD" in upper: record_type="Event"
+
+    # The DATE TIME row is repeated on every data page and is the most reliable source.
     for line in lines:
-        if re.match(r"^\s*Tag\s+", line, re.I):
-            candidates=[x.strip() for x in re.split(r"\s{2,}", line.strip())[1:] if x.strip()]
-            explicit=[canonical_tag(x) for x in candidates if TAG_RE.match(x)]
-            if explicit: tags=explicit
-        if re.match(r"^\s*Unit\s+", line, re.I) and tags:
-            vals=[x.strip() for x in re.split(r"\s{2,}", line.strip())[1:] if x.strip()]
+        upper=line.upper()
+        if "DATE TIME" in upper and ("STEP STATUS" in upper or "EVENT STATUS" in upper):
+            right=re.split(r"DATE TIME",line,flags=re.I,maxsplit=1)[1]
+            right=re.sub(r"(?:STEP|EVENT) STATUS.*$","",right,flags=re.I)
+            found=[canonical_tag(x) for x in TAG_TOKEN_RE.findall(right)]
+            if found:
+                tags=list(dict.fromkeys(found))
+                break
+
+    # The explicit Tag row is authoritative when present.
+    for line in lines:
+        if re.match(r"^\s*Tag\s+",line,re.I):
+            found=[canonical_tag(x) for x in TAG_TOKEN_RE.findall(re.sub(r"^\s*Tag\s+","",line,flags=re.I))]
+            if found: tags=list(dict.fromkeys(found))
+        if re.match(r"^\s*Unit\s+",line,re.I) and tags:
+            vals=[x.strip() for x in re.split(r"\s{2,}",line.strip())[1:] if x.strip()]
             for tag,unit in zip(tags,vals): units[tag]=unit
     return tags,units,record_type
+
 
 def parse_process_report(pages):
     wide_groups={}; long_rows=[]; events=[]; alarms=[]; current_tags=[]; current_units={}; current_type=None
@@ -466,7 +502,13 @@ def parse_process_report(pages):
             if len(tokens)<len(current_tags): continue
             values=tokens[:len(current_tags)]
             if not all(NUMBER_RE.match(v) for v in values): continue
-            status=clean_text(" ".join(tokens[len(current_tags):]))
+            status_tokens=tokens[len(current_tags):]
+            leaked=[]
+            while status_tokens and NUMBER_RE.match(status_tokens[0]):
+                leaked.append(status_tokens.pop(0))
+            status=clean_text(" ".join(status_tokens))
+            if not status:
+                status="STATUS NOT CAPTURED"
             dt=pd.to_datetime(m.group(1)+" "+m.group(2),dayfirst=True)
             row={"Date time":dt,**{tag:float(v) for tag,v in zip(current_tags,values)},"Status":status,"Source page":page_no}
             if (current_type or "Cycle")=="Event":
@@ -478,6 +520,8 @@ def parse_process_report(pages):
     wide={name:pd.DataFrame(rows).drop_duplicates(subset=["Date time"],keep="first").sort_values("Date time") for name,rows in wide_groups.items() if rows}
     long_df=pd.DataFrame(long_rows)
     if not long_df.empty: long_df=long_df.drop_duplicates(subset=["Date time","Instrument tag"],keep="first").sort_values(["Instrument tag","Date time"])
+    if not long_df.empty:
+        long_df["Step status"]=long_df["Step status"].fillna("").astype(str).str.strip()
     return wide,long_df,pd.DataFrame(events),pd.DataFrame(alarms)
 
 def detect_report_type(pages):
@@ -566,7 +610,7 @@ def safe_table(df,height=650,max_rows=3000,key=None):
     st.dataframe(view,use_container_width=True,hide_index=True,height=height,row_height=31,key=key)
 
 st.title("Universal ADAM and OMCA ANFDA Multi-Report Extractor")
-st.caption("Upload multiple reports, manually select ADAM or OMCA ANFDA for each PDF, and process without report-type detection delay.")
+st.caption("Fast extraction uses Poppler pdftotext, then applies the selected ADAM or OMCA parser. Multiple reports are supported without automatic detection delay.")
 uploads=st.sidebar.file_uploader(
     "Upload multiple report PDFs",
     type=["pdf"],
@@ -586,6 +630,11 @@ if large:
     st.error("Each PDF must be 50 MB or smaller: "+", ".join(large))
     st.stop()
 
+st.sidebar.subheader("Processing control")
+process_now=st.sidebar.button("Process uploaded reports",type="primary",use_container_width=True)
+if not process_now and "processed_reports" not in st.session_state:
+    st.info("Select each report type, then click **Process uploaded reports**. Processing will run once and results will remain in the session.")
+
 st.sidebar.subheader("Select report type for each PDF")
 report_type_by_file={}
 for idx,uploaded in enumerate(uploads):
@@ -600,8 +649,8 @@ for idx,uploaded in enumerate(uploads):
     )
 
 @st.cache_data(show_spinner=False, max_entries=2, ttl=1800)
-def process_uploaded_report(file_name, raw, selected_type):
-    pages=extract_pdf_pages(raw)
+def process_uploaded_report(file_name, raw, selected_type, parser_version="status-v2"):
+    pages,extraction_engine,text_extraction_seconds=extract_pdf_pages(raw)
     tag_inventory=scan_report_tag_headers(pages)
     detected_type=selected_type
     adam_score=0; omca_score=0
@@ -616,6 +665,8 @@ def process_uploaded_report(file_name, raw, selected_type):
         error="Select a valid report type."
     meta["File name"]=file_name
     meta["Selected report type"]=selected_type
+    meta["Text extraction engine"]=extraction_engine
+    meta["Text extraction time (s)"]=round(text_extraction_seconds,2)
     if not long_df.empty and "Source report" not in long_df.columns:
         long_df.insert(0,"Source report",file_name)
     if not long_df.empty:
@@ -634,21 +685,28 @@ def process_uploaded_report(file_name, raw, selected_type):
     pages.clear()
     return {
         "file_name":file_name,"detected_type":detected_type,"tag_inventory":tag_inventory,
+        "extraction_engine":extraction_engine,"text_extraction_seconds":text_extraction_seconds,
         "adam_score":adam_score,"omca_score":omca_score,
         "meta":meta,"groups":groups,"long_df":long_df,"events":events,"alarms":alarms,"error":error,
     }
 
-reports=[]
-progress=st.progress(0,text="Starting report processing...")
-for i,uploaded in enumerate(uploads):
-    selected_type=report_type_by_file[uploaded.name]
-    progress.progress(i/len(uploads),text=f"Processing {uploaded.name} as {selected_type} ({i+1} of {len(uploads)})")
-    try:
-        reports.append(process_uploaded_report(uploaded.name,uploaded.getvalue(),selected_type))
-    except Exception as exc:
-        reports.append({"file_name":uploaded.name,"detected_type":"Failed","error":str(exc),"long_df":pd.DataFrame(),"events":pd.DataFrame(),"alarms":pd.DataFrame(),"groups":{},"meta":{"File name":uploaded.name},"adam_score":0,"omca_score":0})
-    gc.collect()
-progress.progress(1.0,text=f"Processed {len(uploads)} report(s)")
+if process_now:
+    reports=[]
+    progress=st.progress(0,text="Starting fast report processing...")
+    for i,uploaded in enumerate(uploads):
+        selected_type=report_type_by_file[uploaded.name]
+        progress.progress(i/len(uploads),text=f"Extracting {uploaded.name} as {selected_type} ({i+1} of {len(uploads)})")
+        try:
+            reports.append(process_uploaded_report(uploaded.name,uploaded.getvalue(),selected_type,"status-v2"))
+        except Exception as exc:
+            reports.append({"file_name":uploaded.name,"detected_type":"Failed","error":str(exc),"long_df":pd.DataFrame(),"events":pd.DataFrame(),"alarms":pd.DataFrame(),"groups":{},"meta":{"File name":uploaded.name},"adam_score":0,"omca_score":0})
+        gc.collect()
+    progress.progress(1.0,text=f"Processed {len(uploads)} report(s)")
+    st.session_state["processed_reports"]=reports
+elif "processed_reports" in st.session_state:
+    reports=st.session_state["processed_reports"]
+else:
+    st.stop()
 
 summary_rows=[]
 for r in reports:
@@ -659,7 +717,9 @@ for r in reports:
         "Header tags":r.get("tag_inventory",pd.DataFrame()).get("Canonical tag",pd.Series(dtype=str)).nunique(),
         "Header tags missing data":int((r.get("tag_inventory",pd.DataFrame()).get("Extracted readings",pd.Series(dtype=int))==0).sum()),
         "Tagwise readings":len(d),"Events":len(r.get("events",pd.DataFrame())),
-        "Alarms":len(r.get("alarms",pd.DataFrame())),"Status":"Error" if r.get("error") else "Processed",
+        "Alarms":len(r.get("alarms",pd.DataFrame())),"Text engine":r.get("extraction_engine",""),
+        "Text extraction (s)":round(r.get("text_extraction_seconds",0),2),
+        "Status":"Error" if r.get("error") else "Processed",
         "Message":r.get("error") or "",
     })
 summary_df=pd.DataFrame(summary_rows)
@@ -675,9 +735,9 @@ report_names=[r["file_name"] for r in valid]
 active_name=st.sidebar.selectbox("Active report",report_names)
 r=next(x for x in valid if x["file_name"]==active_name)
 long_df=r["long_df"]; groups=r["groups"]; events=r["events"]; alarms=r["alarms"]; meta=r["meta"]; tag_inventory=r.get("tag_inventory",pd.DataFrame())
-flow_min_duration=st.sidebar.number_input("Minimum transfer duration (min)",min_value=1.0,max_value=30.0,value=2.0,step=1.0)
-flow_min_change=st.sidebar.number_input("Minimum net weight change (kg)",min_value=0.05,max_value=20.0,value=0.25,step=0.05)
-flow_smoothing=st.sidebar.select_slider("Weight smoothing points",options=[1,3,5,7],value=3)
+flow_min_duration=st.sidebar.number_input("Minimum transfer duration (min)",min_value=1.0,max_value=30.0,value=2.0,step=1.0,key=f"flow_duration_{active_name}")
+flow_min_change=st.sidebar.number_input("Minimum net weight change (kg)",min_value=0.05,max_value=20.0,value=0.25,step=0.05,key=f"flow_change_{active_name}")
+flow_smoothing=st.sidebar.select_slider("Weight smoothing points",options=[1,3,5,7],value=3,key=f"flow_smoothing_{active_name}")
 flow_points,flow_episodes=calculate_transfer_flowrates(long_df,flow_min_duration,flow_min_change,flow_smoothing)
 st.sidebar.success(f"Processing as: {r['detected_type']}")
 
@@ -703,14 +763,28 @@ if combine_same_type:
     st.divider()
 
 st.subheader(f"Active report: {active_name}")
+status_numeric_prefix=int(long_df["Step status"].astype(str).str.match(r"^[-+]?\d").sum()) if not long_df.empty else 0
+q1,q2,q3=st.columns(3)
+q1.metric("Extracted instrument tags",long_df["Instrument tag"].nunique())
+q2.metric("Unique step statuses",long_df["Step status"].nunique())
+q3.metric("Numeric-prefix status rows",status_numeric_prefix)
+if status_numeric_prefix:
+    st.warning("Some status rows still start with numeric values. Clear the application cache and process the report again with this corrected parser.")
 tag_options=long_df[["Instrument tag","HMI display label"]].drop_duplicates().sort_values("Instrument tag")
 tags=tag_options["Instrument tag"].tolist()
-selected_label=st.sidebar.selectbox("Instrument tag / HMI name",tag_options["HMI display label"].tolist())
+selected_label=st.sidebar.selectbox("Instrument tag / HMI name",tag_options["HMI display label"].tolist(),key=f"tag_select_{active_name}")
 selected_tag=tag_options.loc[tag_options["HMI display label"]==selected_label,"Instrument tag"].iloc[0]
 tag_df=long_df[long_df["Instrument tag"]==selected_tag].sort_values("Date time")
-statuses=sorted(tag_df["Step status"].dropna().astype(str).unique())
-chosen=st.sidebar.multiselect("Step status",statuses,default=statuses)
-tag_df=tag_df[tag_df["Step status"].astype(str).isin(chosen)]
+statuses=sorted(x for x in tag_df["Step status"].dropna().astype(str).unique() if x.strip())
+chosen=st.sidebar.multiselect(
+    "Optional step-status filter",
+    statuses,
+    default=[],
+    key=f"status_filter_{active_name}_{selected_tag}",
+    help="Leave empty to display all step statuses. Select values only when you want to filter."
+)
+if chosen:
+    tag_df=tag_df[tag_df["Step status"].astype(str).isin(chosen)]
 
 m1,m2,m3,m4=st.columns(4)
 m1.metric("Uploaded reports",len(uploads)); m2.metric("Processed reports",len(valid))
