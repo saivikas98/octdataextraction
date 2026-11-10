@@ -1,5 +1,6 @@
 from io import BytesIO
 from datetime import datetime, timedelta
+import gc
 import re
 import pandas as pd
 import plotly.express as px
@@ -11,7 +12,320 @@ DATE_RE = re.compile(r"^(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2}:\d{2})\s+(.+)$")
 NUMBER_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
 TAG_RE = re.compile(r"^(?:LSICR|PICR|TICR|TA|TLP|RLS|CP|PT|TT|XV)[A-Z0-9-]*$", re.I)
 
-@st.cache_data(show_spinner=False)
+
+# HMI tag naming derived from the supplied Octreotide Skid HMI screens.
+# Raw report tags are retained for traceability; HMI labels are added for readability.
+HMI_TAG_MAP = {
+    # MV-01 Polymer Mixing Tank
+    "LSICR001": ("MV-01 Polymer Mixing Tank", "Vessel weight / load-cell indication", "kg"),
+    "PICR002": ("MV-01 Polymer Mixing Tank", "Vessel pressure", "bar"),
+    "TICR004": ("MV-01 Polymer Mixing Tank", "Vessel temperature", "°C"),
+    "TA001": ("MV-01 Polymer Mixing Tank", "Agitator speed", "RPM"),
+    "PICR15": ("MV-01 area", "Pressure indication PICR15", "bar"),
+    "PICR16": ("MV-01 area", "Pressure indication PICR16", "bar"),
+    "PICR011": ("MV-01 area", "Pressure indication PICR011", "bar"),
+    "TICR010": ("MV-01 utility line", "Temperature indication TICR010", "°C"),
+    "TICR011": ("MV-01 utility line", "Temperature indication TICR011", "°C"),
+    "TICR012": ("MV-01 utility line", "Temperature indication TICR012", "°C"),
+    "TICR013": ("MV-01 utility line", "Temperature indication TICR013", "°C"),
+    "TICR014": ("MV-01 utility line", "Temperature indication TICR014", "°C"),
+    "TICR021": ("MV-01 utility line", "Temperature indication TICR021", "°C"),
+
+    # MV-02 Dimethicone Collection Tank
+    "LSICR002": ("MV-02 Dimethicone Collection Tank", "Vessel weight / load-cell indication", "kg"),
+    "PICR003": ("MV-02 Dimethicone Collection Tank", "Vessel pressure", "bar"),
+    "TICR005": ("MV-02 Dimethicone Collection Tank", "Vessel temperature", "°C"),
+    "TA002": ("MV-02 Dimethicone Collection Tank", "Agitator speed", "RPM"),
+    "PICR17": ("MV-02 area", "Pressure indication PICR17", "bar"),
+    "PICR18": ("MV-02 area", "Pressure indication PICR18", "bar"),
+    "PICR19": ("MV-02 area", "Pressure indication PICR19", "bar"),
+    "TICR015": ("MV-02 utility line", "Temperature indication TICR015", "°C"),
+    "TICR016": ("MV-02 utility line", "Temperature indication TICR016", "°C"),
+    "TICR071": ("MV-02 utility line", "Temperature indication TICR071", "°C"),
+    "TICR074": ("MV-02 utility line", "Temperature indication TICR074", "°C"),
+
+    # SFV-01 Sterile Filtration Vessel
+    "LSICR003": ("SFV-01 Sterile Filtration Vessel", "Vessel weight / load-cell indication", "kg"),
+    "PICR004": ("SFV-01 Sterile Filtration Vessel", "Vessel pressure", "bar"),
+    "TICR006": ("SFV-01 Sterile Filtration Vessel", "Vessel temperature", "°C"),
+    "TA003": ("SFV-01 Sterile Filtration Vessel", "Agitator speed", "RPM"),
+    "TLP001": ("SFV-01 transfer line", "Transfer-line pump 1 speed", "RPM"),
+    "TLP002": ("SFV-01 transfer line", "Transfer-line pump 2 speed", "RPM"),
+    "TLP01": ("SFV-01 transfer line", "Transfer-line pump 1 speed", "RPM"),
+    "TLP02": ("SFV-01 transfer line", "Transfer-line pump 2 speed", "RPM"),
+    "PICR12": ("SFV-01 area", "Pressure indication PICR12", "bar"),
+    "PICR012": ("SFV-01 area", "Pressure indication PICR012", "bar"),
+    "TICR017": ("SFV-01 utility line", "Temperature indication TICR017", "°C"),
+    "TICR018": ("SFV-01 utility line", "Temperature indication TICR018", "°C"),
+    "TICR019": ("SFV-01 utility line", "Temperature indication TICR019", "°C"),
+    "TICR020": ("SFV-01 utility line", "Temperature indication TICR020", "°C"),
+
+    # MV-04 Coacervation Vessel 100 L
+    "LSICR004": ("MV-04 Coacervation Vessel 100 L", "Vessel weight / load-cell indication", "kg"),
+    "PICR005": ("MV-04 Coacervation Vessel 100 L", "Vessel pressure", "bar"),
+    "TICR007": ("MV-04 Coacervation Vessel 100 L", "Vessel temperature", "°C"),
+    "TA004": ("MV-04 Coacervation Vessel 100 L", "Agitator speed", "RPM"),
+    "PICR20": ("MV-04 area", "Pressure indication PICR20", "bar"),
+    "PICR21": ("MV-04 area", "Pressure indication PICR21", "bar"),
+    "PICR22": ("MV-04 area", "Pressure indication PICR22", "bar"),
+    "PICR23": ("MV-04 area", "Pressure indication PICR23", "bar"),
+    "PICR24": ("MV-04 / MV-05 transfer area", "Pressure indication PICR24", "bar"),
+    "XV242": ("MV-04 CIP line", "Control valve position XV242", "%"),
+    "TICR022": ("MV-04 utility line", "Temperature indication TICR022", "°C"),
+    "TICR023": ("MV-04 utility line", "Temperature indication TICR023", "°C"),
+    "TICR024": ("MV-04 utility line", "Temperature indication TICR024", "°C"),
+    "TICR025": ("MV-04 utility line", "Temperature indication TICR025", "°C"),
+    "TICR026": ("MV-04 utility line", "Temperature indication TICR026", "°C"),
+    "TICR027": ("MV-04 / MV-05 utility line", "Temperature indication TICR027", "°C"),
+
+    # MV-05 Hardening Vessel 1000 L
+    "LSICR005": ("MV-05 Hardening Vessel 1000 L", "Vessel weight / load-cell indication", "kg"),
+    "PICR006": ("MV-05 Hardening Vessel 1000 L", "Vessel pressure", "bar"),
+    "TICR008": ("MV-05 Hardening Vessel 1000 L", "Vessel temperature", "°C"),
+    "TA005": ("MV-05 Hardening Vessel 1000 L", "Agitator speed", "RPM"),
+    "TICR028": ("MV-05 utility line", "Temperature indication TICR028", "°C"),
+    "TICR029": ("MV-05 utility line", "Temperature indication TICR029", "°C"),
+    "TICR048": ("ANFD-02 transfer utility line", "Temperature indication TICR048", "°C"),
+    "TICR054": ("ANFD-02 transfer utility line", "Temperature indication TICR054", "°C"),
+
+    # BV-01 Bed Wash Vessel-01 Ethanol 100 L
+    "LSICR006": ("BV-01 Bed Wash Vessel-01 Ethanol 100 L", "Vessel weight / load-cell indication", "kg"),
+    "PICR007": ("BV-01 Bed Wash Vessel-01 Ethanol 100 L", "Vessel pressure", "bar"),
+    "TICR009": ("BV-01 Bed Wash Vessel-01 Ethanol 100 L", "Vessel temperature", "°C"),
+    "CP005": ("BV-01 Bed Wash Vessel-01 Ethanol 100 L", "Centrifugal pump speed", "RPM"),
+    "DP001": ("BV-01 Bed Wash Vessel-01 Ethanol 100 L", "Pump/control output DP001", "%"),
+    "PICR25": ("BV-01 feed line", "Pressure indication PICR25", "bar"),
+    "PICR26": ("BV-01 feed line", "Pressure indication PICR26", "bar"),
+    "PICR27": ("BV-01 feed line", "Pressure indication PICR27", "bar"),
+    "XV306": ("BV-01 collection/transfer line", "Control valve position XV306", "%"),
+    "TICR030": ("BV-01 utility line", "Temperature indication TICR030", "°C"),
+    "TICR031": ("BV-01 utility line", "Temperature indication TICR031", "°C"),
+    "TICR032": ("BV-01 utility line", "Temperature indication TICR032", "°C"),
+    "TICR033": ("BV-01 utility line", "Temperature indication TICR033", "°C"),
+    "TICR067": ("BV-01 wash-solvent collection line", "Temperature indication TICR067", "°C"),
+    "TICR070": ("BV-01 feed utility line", "Temperature indication TICR070", "°C"),
+
+    # BV-02 Bed Wash Vessel-02 Heptane 100 L
+    "LSICR007": ("BV-02 Bed Wash Vessel-02 Heptane 100 L", "Vessel weight / load-cell indication", "kg"),
+    "PICR008": ("BV-02 Bed Wash Vessel-02 Heptane 100 L", "Vessel pressure", "bar"),
+    "TICR034": ("BV-02 Bed Wash Vessel-02 Heptane 100 L", "Vessel temperature", "°C"),
+    "CP007": ("BV-02 Bed Wash Vessel-02 Heptane 100 L", "Centrifugal pump speed", "RPM"),
+    "PICR28": ("BV-02 feed / transfer line", "Pressure indication PICR28", "bar"),
+    "PICR29": ("BV-02 feed / transfer line", "Pressure indication PICR29", "bar"),
+    "PICR30": ("BV-02 feed / transfer line", "Pressure indication PICR30", "bar"),
+    "PICR31": ("BV-02 feed / transfer line", "Pressure indication PICR31", "bar"),
+    "TICR037": ("BV-02 utility line", "Temperature indication TICR037", "°C"),
+    "TICR038": ("BV-02 utility line", "Temperature indication TICR038", "°C"),
+    "TICR039": ("BV-02 utility line", "Temperature indication TICR039", "°C"),
+    "TICR040": ("BV-02 utility line", "Temperature indication TICR040", "°C"),
+    "TICR041": ("BV-02 utility line", "Temperature indication TICR041", "°C"),
+    "TICR042": ("BV-02 utility line", "Temperature indication TICR042", "°C"),
+
+    # MLT-01 Mother Liquor Tank-01 100 L
+    "RLS001": ("MLT-01 Mother Liquor Tank-01 100 L", "Vessel level / volume indication", "L"),
+    "PICR009": ("MLT-01 Mother Liquor Tank-01 100 L", "Vessel pressure", "bar"),
+    "TICR035": ("MLT-01 Mother Liquor Tank-01 100 L", "Vessel temperature", "°C"),
+    "PICR37": ("MLT-01 area", "Pressure indication PICR37", "bar"),
+    "PICR38": ("MLT-01 area", "Pressure indication PICR38", "bar"),
+    "PICR39": ("MLT-01 area", "Pressure indication PICR39", "bar"),
+    "TICR055": ("MLT-01 utility line", "Temperature indication TICR055", "°C"),
+    "TICR056": ("MLT-01 utility line", "Temperature indication TICR056", "°C"),
+    "TICR057": ("MLT-01 utility line", "Temperature indication TICR057", "°C"),
+    "TICR068": ("MLT-01 heat-exchanger utility line", "Temperature indication TICR068", "°C"),
+    "DP002": ("MLT-01 utility / condensate line", "DP002 indication", ""),
+
+    # MLT-02 Mother Liquor Tank-02 100 L
+    "RLS002": ("MLT-02 Mother Liquor Tank-02 100 L", "Vessel level / volume indication", "L"),
+    "PICR010": ("MLT-02 Mother Liquor Tank-02 100 L", "Vessel pressure", "bar"),
+    "TICR036": ("MLT-02 Mother Liquor Tank-02 100 L", "Vessel temperature", "°C"),
+    "PICR40": ("MLT-02 area", "Pressure indication PICR40", "bar"),
+    "PICR41": ("MLT-02 area", "Pressure indication PICR41", "bar"),
+    "PICR42": ("MLT-02 area", "Pressure indication PICR42", "bar"),
+    "TICR058": ("MLT-02 utility line", "Temperature indication TICR058", "°C"),
+    "TICR061": ("MLT-02 utility line", "Temperature indication TICR061", "°C"),
+    "TICR062": ("MLT-02 utility line", "Temperature indication TICR062", "°C"),
+    "TICR065": ("MLT-02 heat-exchanger utility line", "Temperature indication TICR065", "°C"),
+
+    # Shared mother-liquor transfer system
+    "CP006": ("MLT-01 / MLT-02 Mother Liquor Transfer System", "Centrifugal pump speed", "RPM"),
+
+    # Heptane Tank 10,000 L and recirculation / transfer pumps
+    "PICR001": ("Heptane Tank 10,000 L", "Tank pressure", "bar"),
+    "RLS005": ("Heptane Tank 10,000 L", "Tank level / volume indication", "L"),
+    "CP011": ("Heptane Tank recirculation / transfer system", "Centrifugal pump CP011 speed", "RPM"),
+    "CP012": ("Heptane Tank recirculation / transfer system", "Centrifugal pump CP012 speed", "RPM"),
+    "MFM": ("Heptane Tank transfer line", "Mass flow rate", "kg/h"),
+
+    # ANFD-1
+    "PICR34": ("ANFD-1", "Mechanical-seal pressure PICR34", "bar"),
+    "PICR35": ("ANFD-1", "Mechanical-seal pressure PICR35", "bar"),
+    "PICR36": ("ANFD-1", "Mechanical-seal pressure PICR36", "bar"),
+    "TICR049": ("ANFD-1 utility line", "Temperature indication TICR049", "°C"),
+    "TICR050": ("ANFD-1 utility line", "Temperature indication TICR050", "°C"),
+    "TICR051": ("ANFD-1 utility line", "Temperature indication TICR051", "°C"),
+    "TICR052": ("ANFD-1 utility line", "Temperature indication TICR052", "°C"),
+    "TICR053": ("ANFD-1 utility line", "Temperature indication TICR053", "°C"),
+    "TICR054": ("ANFD-1 / ANFD-2 shared utility indication", "Temperature indication TICR054", "°C"),
+    "TICR069": ("ANFD-1 TCU-H03 utility line", "Temperature indication TICR069", "°C"),
+
+    # ANFD-2
+    "PICR32": ("ANFD-2", "Mechanical-seal pressure PICR32", "bar"),
+    "PICR33": ("ANFD-2", "Mechanical-seal pressure PICR33", "bar"),
+    "PICR43": ("ANFD-2", "Mechanical-seal pressure PICR43", "bar"),
+    "TICR043": ("ANFD-2 utility line", "Temperature indication TICR043", "°C"),
+    "TICR044": ("ANFD-2 utility line", "Temperature indication TICR044", "°C"),
+    "TICR045": ("ANFD-2 utility line", "Temperature indication TICR045", "°C"),
+    "TICR046": ("ANFD-2 utility line", "Temperature indication TICR046", "°C"),
+    "TICR047": ("ANFD-2 utility line", "Temperature indication TICR047", "°C"),
+    "TICR048": ("ANFD-2 utility line", "Temperature indication TICR048", "°C"),
+    "TICR066": ("ANFD-2 TCU-H07 utility line", "Temperature indication TICR066", "°C"),
+
+    # Utility distribution and headers
+    "XV001": ("Utility Distribution - Pure Steam Inlet", "Pure-steam inlet control-valve output", "%"),
+    "PICR13": ("Utility Distribution - Nitrogen Header", "Nitrogen inlet pressure", "bar"),
+    "PICR14": ("Utility Distribution - Process Air Header", "Process-air inlet pressure", "bar"),
+    "TICR001": ("Utility Distribution - Drain Header", "Drain-header temperature TICR001", "°C"),
+    "TICR002": ("Utility Distribution - Drain Header", "Drain-header temperature TICR002", "°C"),
+    "TICR003": ("Utility Distribution - Drain Header", "Drain-header temperature TICR003", "°C"),
+
+    # CIP solution tank, WFI tank and wash-solvent loop
+    "PICR044": ("CIP Solution Tank MDC 1000 L", "Tank pressure", "bar"),
+    "RLS003": ("CIP Solution Tank MDC 1000 L", "Tank level / volume indication", "L"),
+    "RLS007": ("WFI Tank 1000 L", "Tank level / volume indication", "L"),
+    "QICR01": ("Wash Solvent Return Loop", "pH indication QICR01", "pH"),
+    "QICR02": ("CIP Recirculation Loop", "pH indication QICR02", "pH"),
+    "CICR01": ("CIP Drain / Wash Solvent Loop", "Conductivity indication CICR01", "µS/cm"),
+    "CICR002": ("Wash Solvent Return Loop", "Conductivity indication CICR002", "µS/cm"),
+    "CP002": ("CIP Recirculation System", "Centrifugal pump CP002 speed", "RPM"),
+    "CP003": ("WFI Tank 1000 L", "WFI circulation pump CP003 speed", "RPM"),
+    "CP004": ("WFI Tank 1000 L", "WFI circulation pump CP004 speed", "RPM"),
+    "CP010": ("Wash Solvent Return Loop", "Centrifugal pump CP010 speed", "RPM"),
+
+    # Spent-solvent and wash-solvent collection
+    "RLS004": ("Spent Solvent Storage Tank 20,000 L", "Tank level / volume indication", "L"),
+    "PICR045": ("Spent Solvent Storage Tank 20,000 L", "Tank pressure", "bar"),
+    "RLS006": ("Wash Solvent Collection Tank 200 L", "Tank level / volume indication", "L"),
+    "PICR46": ("Wash Solvent Collection Tank 200 L", "Tank pressure", "bar"),
+    "CP008": ("Wash Solvent Collection System", "Centrifugal pump CP008 speed", "RPM"),
+
+    # OMCA ANFDA drying HMI/report names
+    "TT-01": ("OMCA ANFDA drying system", "Temperature TT-01", "°C"),
+    "TT-02": ("OMCA ANFDA drying system", "Temperature TT-02", "°C"),
+    "PT-01": ("OMCA ANFDA drying system", "Pressure PT-01", "barg"),
+    "PICR32": ("ANFD-2 / OMCA ANFDA drying system", "Pressure PICR32", "barg"),
+    "TICR066": ("ANFD-2 / OMCA ANFDA drying system", "Temperature TICR066", "°C"),
+    "Filter_Pos": ("OMCA ANFDA drying system", "Filter position", "°"),
+    "Agit_Rpm": ("OMCA ANFDA drying system", "Agitator speed", "RPM"),
+    "Agit_Pos": ("OMCA ANFDA drying system", "Agitator axial position", "mm"),
+}
+
+FLOW_SOURCE_TAGS = {
+    "LSICR001": "MV-01 Polymer Mixing Tank",
+    "LSICR002": "MV-02 Dimethicone Collection Tank",
+    "LSICR003": "SFV-01 Sterile Filtration Vessel",
+    "LSICR004": "MV-04 Coacervation Vessel",
+    "LSICR005": "MV-05 Hardening Vessel",
+    "LSICR006": "BV-01 Bed Wash Vessel-01 Ethanol",
+    "LSICR007": "BV-02 Bed Wash Vessel-02 Heptane",
+}
+
+FLOW_DESTINATION_HINTS = {
+    "LSICR001": "Downstream vessel identified from step status",
+    "LSICR002": "Downstream vessel identified from step status",
+    "LSICR003": "MV-04 / downstream vessel identified from step status",
+    "LSICR004": "MV-05 / downstream vessel identified from step status",
+    "LSICR005": "BV / ANFD / downstream vessel identified from step status",
+    "LSICR006": "ANFD / downstream vessel identified from step status",
+    "LSICR007": "ANFD / downstream vessel identified from step status",
+}
+
+def infer_destination(status):
+    u=str(status or "").upper()
+    aliases=[
+        ("MV-01","MV-01 Polymer Mixing Tank"),("MV01","MV-01 Polymer Mixing Tank"),
+        ("MV-02","MV-02 Dimethicone Collection Tank"),("MV02","MV-02 Dimethicone Collection Tank"),
+        ("SFV-01","SFV-01 Sterile Filtration Vessel"),("SFV01","SFV-01 Sterile Filtration Vessel"),
+        ("MV-04","MV-04 Coacervation Vessel"),("MV04","MV-04 Coacervation Vessel"),
+        ("MV-05","MV-05 Hardening Vessel"),("MV05","MV-05 Hardening Vessel"),
+        ("BV-01","BV-01 Bed Wash Vessel-01 Ethanol"),("BV01","BV-01 Bed Wash Vessel-01 Ethanol"),
+        ("BV-02","BV-02 Bed Wash Vessel-02 Heptane"),("BV02","BV-02 Bed Wash Vessel-02 Heptane"),
+        ("MLT-01","MLT-01 Mother Liquor Tank-01"),("MLT01","MLT-01 Mother Liquor Tank-01"),
+        ("MLT-02","MLT-02 Mother Liquor Tank-02"),("MLT02","MLT-02 Mother Liquor Tank-02"),
+        ("ANFD-01","ANFD-1"),("ANFD01","ANFD-1"),("ANFD-1","ANFD-1"),
+        ("ANFD-02","ANFD-2"),("ANFD02","ANFD-2"),("ANFD-2","ANFD-2"),
+    ]
+    hits=[]
+    for token,name in aliases:
+        if token in u and name not in hits: hits.append(name)
+    return " -> ".join(hits[-2:]) if hits else "Destination not explicit in step status"
+
+def calculate_transfer_flowrates(long_df, min_duration_min=2.0, min_weight_change_kg=0.25, smoothing_points=3):
+    """Estimate mass-transfer rate from sustained vessel weight change.
+
+    Flow = -d(weight)/dt for source-vessel discharge and +d(weight)/dt for receiving-vessel charge.
+    Short spikes are excluded using duration and total-weight-change thresholds.
+    """
+    if long_df is None or long_df.empty:
+        return pd.DataFrame(),pd.DataFrame()
+    load=long_df[long_df["Instrument tag"].isin(FLOW_SOURCE_TAGS)].copy()
+    if load.empty:
+        return pd.DataFrame(),pd.DataFrame()
+    point_parts=[]; episode_rows=[]
+    for (source_report,tag),g in load.groupby(["Source report","Instrument tag"],dropna=False) if "Source report" in load.columns else load.assign(**{"Source report":"Active report"}).groupby(["Source report","Instrument tag"]):
+        g=g.sort_values("Date time").drop_duplicates("Date time").copy()
+        g["Smoothed weight (kg)"]=g["Value"].rolling(max(1,int(smoothing_points)),center=True,min_periods=1).median()
+        g["Interval (min)"]=g["Date time"].diff().dt.total_seconds().div(60)
+        g["Weight change (kg)"]=g["Smoothed weight (kg)"].diff()
+        g["Signed flow (kg/min)"]=g["Weight change (kg)"].div(g["Interval (min)"])
+        g.loc[(g["Interval (min)"]<=0)|(g["Interval (min)"]>5),"Signed flow (kg/min)"]=pd.NA
+        g["Transfer direction"]=g["Signed flow (kg/min)"].apply(lambda x:"Receiving / charging" if pd.notna(x) and x>0 else ("Source / discharging" if pd.notna(x) and x<0 else "No measurable transfer"))
+        g["Transfer flowrate (kg/min)"]=g["Signed flow (kg/min)"].abs()
+        g["Transfer flowrate (kg/h)"]=g["Transfer flowrate (kg/min)"]*60
+        g["Source vessel"]=FLOW_SOURCE_TAGS[tag]
+        g["Destination / route"]=g["Step status"].map(infer_destination)
+        active=g["Signed flow (kg/min)"].abs().ge(0.02) & g["Signed flow (kg/min)"].notna()
+        # Split episodes when direction, activity, status, or time continuity changes.
+        direction=g["Signed flow (kg/min)"].apply(lambda x:1 if pd.notna(x) and x>0 else (-1 if pd.notna(x) and x<0 else 0))
+        split=(active.ne(active.shift())|direction.ne(direction.shift())|g["Step status"].ne(g["Step status"].shift())|g["Interval (min)"].gt(5)).cumsum()
+        g["Transfer episode"]=split
+        point_parts.append(g)
+        for episode,ep in g[active].groupby("Transfer episode"):
+            if ep.empty: continue
+            start=ep.iloc[0]["Date time"]-pd.to_timedelta(float(ep.iloc[0]["Interval (min)"] or 0),unit="m")
+            end=ep.iloc[-1]["Date time"]
+            duration=(end-start).total_seconds()/60
+            weight_change=ep["Weight change (kg)"].sum()
+            if duration < float(min_duration_min) or abs(weight_change) < float(min_weight_change_kg): continue
+            avg=abs(weight_change)/duration
+            episode_rows.append({
+                "Source report":source_report,"Instrument tag":tag,"Vessel":FLOW_SOURCE_TAGS[tag],
+                "Direction":"Receiving / charging" if weight_change>0 else "Source / discharging",
+                "Destination / route":infer_destination(" ".join(ep["Step status"].astype(str).unique())),
+                "Start":start,"End":end,"Duration (min)":duration,"Net weight change (kg)":weight_change,
+                "Average flow (kg/min)":avg,"Average flow (kg/h)":avg*60,
+                "Peak interval flow (kg/min)":ep["Transfer flowrate (kg/min)"].max(),
+                "Step status":" | ".join(ep["Step status"].astype(str).unique()),
+            })
+    points=pd.concat(point_parts,ignore_index=True) if point_parts else pd.DataFrame()
+    episodes=pd.DataFrame(episode_rows).sort_values(["Source report","Start"]) if episode_rows else pd.DataFrame()
+    return points,episodes
+
+def add_hmi_tag_names(df):
+    """Add HMI equipment and measurement names while preserving the raw report tag."""
+    if df is None or df.empty or "Instrument tag" not in df.columns:
+        return df
+    out=df.copy()
+    def details(tag):
+        equipment, measurement, default_unit=HMI_TAG_MAP.get(str(tag),("Not mapped from supplied HMI screens",f"Instrument tag {tag}",""))
+        return equipment,measurement,default_unit
+    detail=out["Instrument tag"].map(details)
+    out["HMI equipment"]=detail.map(lambda x:x[0])
+    out["HMI measurement name"]=detail.map(lambda x:x[1])
+    if "Unit" in out.columns:
+        out["Unit"]=out.apply(lambda r: r["Unit"] if str(r["Unit"]).strip() else details(r["Instrument tag"])[2],axis=1)
+    out["HMI display label"]=out.apply(lambda r:f"{r['Instrument tag']} | {r['HMI equipment']} | {r['HMI measurement name']}",axis=1)
+    return out
+
 def extract_pdf_pages(raw: bytes):
     with pdfplumber.open(BytesIO(raw)) as pdf:
         return [page.extract_text(layout=True) or "" for page in pdf.pages]
@@ -165,12 +479,17 @@ def parse_omca_anfd_report(pages):
     groups={"OMCA ANFDA Drying":wide_df}
     return groups,long_df,pd.DataFrame(),pd.DataFrame(alarms)
 
-def safe_table(df,height=650):
-    view=df.copy().reset_index(drop=True)
+def safe_table(df,height=650,max_rows=3000,key=None):
+    total=len(df)
+    if total>max_rows:
+        st.caption(f"Displaying the first {max_rows:,} of {total:,} rows for browser stability. Calculations use all rows.")
+        view=df.head(max_rows).copy().reset_index(drop=True)
+    else:
+        view=df.copy().reset_index(drop=True)
     for c in view.columns:
         if pd.api.types.is_datetime64_any_dtype(view[c]): view[c]=view[c].dt.strftime("%d/%m/%Y %H:%M:%S").fillna("")
-        elif view[c].dtype=="object": view[c]=view[c].fillna("").astype(str)
-    st.dataframe(view,use_container_width=True,hide_index=True,height=height,row_height=31)
+        elif str(view[c].dtype) in ("object","category"): view[c]=view[c].astype(str).replace("nan","")
+    st.dataframe(view,use_container_width=True,hide_index=True,height=height,row_height=31,key=key)
 
 st.title("Universal ADAM and OMCA ANFDA Multi-Report Extractor")
 st.caption("Upload multiple ADAM Skid Process and OMCA ANFDA/ANFD-2 drying reports together. Each PDF is detected automatically and processed independently in memory.")
@@ -184,7 +503,16 @@ if not uploads:
     st.info("Upload one or more supported PDFs. Report formats will be detected automatically.")
     st.stop()
 
-@st.cache_data(show_spinner=False)
+
+if len(uploads)>5:
+    st.error("Upload a maximum of 5 reports per processing run to avoid Streamlit Community Cloud memory exhaustion.")
+    st.stop()
+large=[f.name for f in uploads if f.size>50*1024*1024]
+if large:
+    st.error("Each PDF must be 50 MB or smaller: "+", ".join(large))
+    st.stop()
+
+@st.cache_data(show_spinner=False, max_entries=2, ttl=1800)
 def process_uploaded_report(file_name, raw):
     pages=extract_pdf_pages(raw)
     detected_type,adam_score,omca_score,adam_markers,omca_markers=detect_report_type(pages)
@@ -200,8 +528,17 @@ def process_uploaded_report(file_name, raw):
     meta["File name"]=file_name
     meta["Detected report type"]=detected_type
     meta["Detection score"]=f"ADAM {adam_score}/5 | OMCA {omca_score}/5"
+    if not long_df.empty and "Source report" not in long_df.columns:
+        long_df.insert(0,"Source report",file_name)
+    if not long_df.empty:
+        long_df["Value"]=pd.to_numeric(long_df["Value"],errors="coerce",downcast="float")
+        long_df["Source page"]=pd.to_numeric(long_df["Source page"],errors="coerce",downcast="integer")
+        for c in ["Source report","Instrument tag","Unit","Step status","Instrument group"]:
+            if c in long_df: long_df[c]=long_df[c].astype("category")
+    long_df=add_hmi_tag_names(long_df)
+    pages.clear()
     return {
-        "file_name":file_name,"pages":pages,"detected_type":detected_type,
+        "file_name":file_name,"detected_type":detected_type,
         "adam_score":adam_score,"omca_score":omca_score,
         "adam_markers":adam_markers,"omca_markers":omca_markers,
         "meta":meta,"groups":groups,"long_df":long_df,"events":events,"alarms":alarms,"error":error,
@@ -215,6 +552,7 @@ for i,uploaded in enumerate(uploads):
         reports.append(process_uploaded_report(uploaded.name,uploaded.getvalue()))
     except Exception as exc:
         reports.append({"file_name":uploaded.name,"detected_type":"Failed","error":str(exc),"long_df":pd.DataFrame(),"events":pd.DataFrame(),"alarms":pd.DataFrame(),"groups":{},"meta":{"File name":uploaded.name},"adam_score":0,"omca_score":0})
+    gc.collect()
 progress.progress(1.0,text=f"Processed {len(uploads)} report(s)")
 
 summary_rows=[]
@@ -240,24 +578,38 @@ report_names=[r["file_name"] for r in valid]
 active_name=st.sidebar.selectbox("Active report",report_names)
 r=next(x for x in valid if x["file_name"]==active_name)
 long_df=r["long_df"]; groups=r["groups"]; events=r["events"]; alarms=r["alarms"]; meta=r["meta"]
+flow_min_duration=st.sidebar.number_input("Minimum transfer duration (min)",min_value=1.0,max_value=30.0,value=2.0,step=1.0)
+flow_min_change=st.sidebar.number_input("Minimum net weight change (kg)",min_value=0.05,max_value=20.0,value=0.25,step=0.05)
+flow_smoothing=st.sidebar.select_slider("Weight smoothing points",options=[1,3,5,7],value=3)
+flow_points,flow_episodes=calculate_transfer_flowrates(long_df,flow_min_duration,flow_min_change,flow_smoothing)
 st.sidebar.success(f"Detected: {r['detected_type']}")
 
 combine_same_type=st.sidebar.checkbox("Combine all processed reports",value=False)
 if combine_same_type:
-    combined=[]
+    option_parts=[item["long_df"][["Instrument tag","HMI display label"]].drop_duplicates() for item in valid]
+    combined_options=pd.concat(option_parts,ignore_index=True).drop_duplicates().sort_values("Instrument tag")
+    combined_label=st.selectbox("Combined instrument tag",combined_options["HMI display label"].tolist(),key="combined_tag")
+    combined_tag=combined_options.loc[combined_options["HMI display label"]==combined_label,"Instrument tag"].iloc[0]
+    selected_parts=[]
     for item in valid:
-        part=item["long_df"].copy(); part.insert(0,"Source report",item["file_name"]); part.insert(1,"Report type",item["detected_type"]); combined.append(part)
-    combined_long=pd.concat(combined,ignore_index=True)
-    st.subheader("Combined tagwise data across all uploaded reports")
-    st.caption(f"{len(valid)} reports | {combined_long['Instrument tag'].nunique()} unique tags | {len(combined_long):,} tagwise readings")
-    combined_tag=st.selectbox("Combined instrument tag",sorted(combined_long["Instrument tag"].unique()),key="combined_tag")
-    combined_view=combined_long[combined_long["Instrument tag"]==combined_tag].sort_values(["Source report","Date time"])
-    safe_table(combined_view,height=650)
+        part=item["long_df"]
+        part=part[part["Instrument tag"].astype(str)==str(combined_tag)].copy()
+        if not part.empty:
+            part["Source report"]=item["file_name"]
+            part["Report type"]=item["detected_type"]
+            selected_parts.append(part)
+    combined_view=pd.concat(selected_parts,ignore_index=True).sort_values(["Source report","Date time"]) if selected_parts else pd.DataFrame()
+    st.subheader("Combined selected-tag data across uploaded reports")
+    st.caption(f"{len(valid)} processed reports | {len(combined_view):,} matching readings")
+    safe_table(combined_view,height=650,max_rows=3000,key="combined_table")
+    del selected_parts, combined_view
     st.divider()
 
 st.subheader(f"Active report: {active_name}")
-tags=sorted(long_df["Instrument tag"].unique())
-selected_tag=st.sidebar.selectbox("Instrument tag number",tags)
+tag_options=long_df[["Instrument tag","HMI display label"]].drop_duplicates().sort_values("Instrument tag")
+tags=tag_options["Instrument tag"].tolist()
+selected_label=st.sidebar.selectbox("Instrument tag / HMI name",tag_options["HMI display label"].tolist())
+selected_tag=tag_options.loc[tag_options["HMI display label"]==selected_label,"Instrument tag"].iloc[0]
 tag_df=long_df[long_df["Instrument tag"]==selected_tag].sort_values("Date time")
 statuses=sorted(tag_df["Step status"].dropna().astype(str).unique())
 chosen=st.sidebar.multiselect("Step status",statuses,default=statuses)
@@ -267,27 +619,49 @@ m1,m2,m3,m4=st.columns(4)
 m1.metric("Uploaded reports",len(uploads)); m2.metric("Processed reports",len(valid))
 m3.metric("Active report tags",len(tags)); m4.metric("Active tag readings",f"{len(tag_df):,}")
 
-summary=long_df.groupby(["Instrument tag","Unit"],dropna=False).agg(Records=("Value","size"),Start=("Date time","min"),End=("Date time","max"),Minimum=("Value","min"),Maximum=("Value","max"),Mean=("Value","mean")).reset_index()
+summary=long_df.groupby(["Instrument tag","HMI equipment","HMI measurement name","Unit"],dropna=False).agg(Records=("Value","size"),Start=("Date time","min"),End=("Date time","max"),Minimum=("Value","min"),Maximum=("Value","max"),Mean=("Value","mean")).reset_index()
 
-tabs=st.tabs(["Selected tag","Tag summary","Instrument groups","All tagwise data","Events & alarms","Metadata"])
+tabs=st.tabs(["Selected tag","Tag summary","Transfer flowrate","HMI tag dictionary","Instrument groups","All tagwise data","Events & alarms","Metadata"])
 with tabs[0]:
-    st.subheader(f"Instrument tag: {selected_tag}")
+    selected_equipment=tag_df["HMI equipment"].iloc[0] if not tag_df.empty else ""
+    selected_measurement=tag_df["HMI measurement name"].iloc[0] if not tag_df.empty else ""
+    st.subheader(f"{selected_tag}: {selected_measurement}")
+    st.caption(f"HMI equipment: {selected_equipment}")
     unit=tag_df["Unit"].dropna().astype(str).replace("",pd.NA).dropna().iloc[0] if tag_df["Unit"].astype(str).str.len().gt(0).any() else ""
     plot_df=tag_df.iloc[::max(1,len(tag_df)//3000)]
     fig=px.line(plot_df,x="Date time",y="Value",title=f"{selected_tag} trend",labels={"Value":f"Value ({unit})" if unit else "Value"})
     st.plotly_chart(fig,use_container_width=True)
-    safe_table(tag_df[["Date time","Instrument tag","Value","Unit","Step status","Source page"]])
+    safe_table(tag_df[["Date time","Instrument tag","HMI equipment","HMI measurement name","Value","Unit","Step status","Source page"]])
 with tabs[1]:
     safe_table(summary,height=600)
 with tabs[2]:
+    st.subheader("Calculated material-transfer flowrate from vessel weight")
+    st.caption("Mass flow is estimated from the slope of LSICR vessel weight: |Δweight| / Δtime. Negative slope is discharge; positive slope is receiving/charging. Results are mass flow only, not volumetric flow.")
+    if flow_episodes.empty:
+        st.info("No sustained weight-transfer episodes met the selected duration and weight-change thresholds.")
+    else:
+        source_tags=sorted(flow_episodes["Instrument tag"].unique())
+        flow_tag=st.selectbox("Load-cell tag",source_tags,key="flow_tag")
+        episode_view=flow_episodes[flow_episodes["Instrument tag"]==flow_tag].copy()
+        safe_table(episode_view,height=520)
+        point_view=flow_points[(flow_points["Instrument tag"]==flow_tag)&flow_points["Transfer flowrate (kg/min)"].notna()].copy()
+        if not point_view.empty:
+            plot=point_view.iloc[::max(1,len(point_view)//3000)]
+            fig=px.line(plot,x="Date time",y="Transfer flowrate (kg/min)",color="Transfer direction",title=f"Calculated transfer flowrate: {flow_tag}")
+            st.plotly_chart(fig,use_container_width=True)
+            safe_table(point_view[["Date time","Instrument tag","Source vessel","Destination / route","Smoothed weight (kg)","Weight change (kg)","Interval (min)","Transfer direction","Transfer flowrate (kg/min)","Transfer flowrate (kg/h)","Step status"]],height=620)
+with tabs[3]:
+    mapping=long_df[["Instrument tag","HMI equipment","HMI measurement name","Unit"]].drop_duplicates().sort_values(["HMI equipment","Instrument tag"])
+    safe_table(mapping,height=650)
+with tabs[4]:
     group_name=st.selectbox("Instrument group",list(groups.keys()))
     safe_table(groups[group_name])
-with tabs[3]:
+with tabs[5]:
     search=st.text_input("Search tag, status, unit or timestamp")
     view=long_df
     if search: view=view[view.astype(str).apply(lambda x:x.str.contains(search,case=False,na=False)).any(axis=1)]
     safe_table(view)
-with tabs[4]:
+with tabs[6]:
     a,b=st.columns(2)
     with a:
         st.subheader(f"Event records ({len(events):,})")
@@ -295,7 +669,7 @@ with tabs[4]:
     with b:
         st.subheader(f"Alarm records ({len(alarms):,})")
         safe_table(alarms,height=520) if not alarms.empty else st.info("No alarm records extracted.")
-with tabs[5]:
+with tabs[7]:
     safe_table(pd.DataFrame(meta.items(),columns=["Field","Value"]),height=430)
 
 st.caption("All PDFs are processed independently in memory. The app does not create or store Excel/CSV files.")
