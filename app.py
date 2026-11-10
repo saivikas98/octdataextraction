@@ -1,135 +1,163 @@
+from io import BytesIO
+import re
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-from parser_engine import parse_pdf
+import pdfplumber
 
-st.set_page_config(page_title="ANFD Dual Report Viewer",page_icon="📊",layout="wide")
-
-def display_table(df, key, height=700, page_size=None):
-    """Render the complete dataset as one combined table without pagination."""
-    view = df.copy().reset_index(drop=True)
-    if view.empty:
-        st.info("No records available for the selected filters.")
-        return
-
-    # Convert values to Arrow-safe display types before Streamlit creates cells.
-    for col in view.columns:
-        if pd.api.types.is_datetime64_any_dtype(view[col]):
-            view[col] = view[col].dt.strftime("%d/%m/%Y %H:%M:%S").fillna("")
-        elif pd.api.types.is_numeric_dtype(view[col]):
-            view[col] = pd.to_numeric(view[col], errors="coerce")
-        else:
-            view[col] = view[col].fillna("").astype(str)
-
-    st.caption(f"Combined table: all {len(view):,} records shown in one table. Scroll vertically to view every row.")
-    st.dataframe(
-        view,
-        use_container_width=True,
-        hide_index=True,
-        height=height,
-        row_height=32,
-        key=f"combined_{key}",
-    )
-
-def chart_data(df, max_points=2500):
-    """Keep the full table while limiting only chart points for browser stability."""
-    if len(df) <= max_points:
-        return df
-    step = max(1, len(df) // max_points)
-    sampled = df.iloc[::step].copy()
-    if sampled.index[-1] != df.index[-1]:
-        sampled = pd.concat([sampled, df.iloc[[-1]]])
-    return sampled
-
-st.title("ANFD Drying Report Viewer")
-st.caption("Supports both the ANFD Drying Cycle report and the ADAM Process System drying report. Data is displayed in memory only.")
-files=st.sidebar.file_uploader("Upload one or both PDF reports",type=["pdf"],accept_multiple_files=True)
-if not files:
-    st.info("Upload either report type, or upload both reports together for side-by-side selection. No Excel or CSV file is created.")
-    st.stop()
+st.set_page_config(page_title="ADAM Process Report - Tagwise Extraction", page_icon="📊", layout="wide")
+DATE_RE = re.compile(r"^(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2}:\d{2})\s+(.+)$")
+NUMBER_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
+TAG_RE = re.compile(r"^(?:LSICR|PICR|TICR|TA|TLP|RLS|CP|PT|TT|XV)[A-Z0-9-]*$", re.I)
 
 @st.cache_data(show_spinner=False)
-def load(name,raw,report_choice):
-    return parse_pdf(raw, report_choice)
+def extract_pdf_pages(raw: bytes):
+    with pdfplumber.open(BytesIO(raw)) as pdf:
+        return [page.extract_text(layout=True) or "" for page in pdf.pages]
 
-reports={}
-st.sidebar.subheader("Select report type")
-for i,uploaded in enumerate(files):
-    choice=st.sidebar.selectbox(
-        f"Format for {uploaded.name}",
-        ["Auto-detect","ADAM drying-cycle report","OMCA ANFDA process-system report"],
-        key=f"format_{i}_{uploaded.name}",
-        help="If auto-detect gives an unsupported-layout error, choose the report source manually."
-    )
-    try:
-        with st.spinner(f"Reading {uploaded.name} as {choice}..."):
-            reports[uploaded.name]=load(uploaded.name,uploaded.getvalue(),choice)
-    except Exception as e:
-        st.error(f"{uploaded.name}: {e}")
-if not reports:
-    st.warning("No report could be loaded. Select the correct report type beside each uploaded file.")
+def clean_text(value):
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", str(value or "")).strip()
+
+def metadata_from_pages(pages):
+    first="\n".join(pages[:3])
+    def find(pattern, default="Not detected"):
+        m=re.search(pattern, first, re.I)
+        return clean_text(m.group(1)) if m else default
+    return {
+        "Equipment ID": find(r"EQUIPMENT ID\s*:?\s*([^\n]+)"),
+        "Product name": find(r"PRODUCT NAME\s*:?\s*([^\n]+)"),
+        "Product code": find(r"PRODUCT CODE\s*:?\s*([^\n]+)"),
+        "Batch number": find(r"BATCH NUMBER\s*:?\s*([A-Z0-9-]+)"),
+        "Operator name": find(r"OPERATOR NAME\s*:?\s*([^\n]+)"),
+        "Cycle selected": find(r"CYCLE SELECTED\s*:?\s*([^\n]+)"),
+        "Start date/time": find(r"START DATE TIME\s*:?\s*(\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2})"),
+        "End date/time": find(r"END DATE TIME\s*:?\s*(\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2})"),
+        "PDF pages": len(pages),
+    }
+
+def header_tags(page_text):
+    lines=page_text.splitlines()
+    tags=[]; units={}; record_type=None
+    for line in lines:
+        u=line.upper()
+        if "CYCLE RECORD" in u: record_type="Cycle"
+        if "EVENT RECORD" in u: record_type="Event"
+        if "DATE TIME" in u and ("STEP STATUS" in u or "EVENT STATUS" in u):
+            right=re.split(r"DATE TIME", line, flags=re.I, maxsplit=1)[1]
+            right=re.sub(r"(?:STEP|EVENT) STATUS.*$", "", right, flags=re.I)
+            candidates=[x.strip() for x in re.split(r"\s{2,}", right) if x.strip()]
+            tags=[x for x in candidates if TAG_RE.match(x)]
+            break
+    # Prefer the explicit Tag row, which is authoritative.
+    for line in lines:
+        if re.match(r"^\s*Tag\s+", line, re.I):
+            candidates=[x.strip() for x in re.split(r"\s{2,}", line.strip())[1:] if x.strip()]
+            explicit=[x for x in candidates if TAG_RE.match(x)]
+            if explicit: tags=explicit
+        if re.match(r"^\s*Unit\s+", line, re.I) and tags:
+            vals=[x.strip() for x in re.split(r"\s{2,}", line.strip())[1:] if x.strip()]
+            for tag,unit in zip(tags,vals): units[tag]=unit
+    return tags,units,record_type
+
+def parse_process_report(pages):
+    wide_groups={}; long_rows=[]; events=[]; alarms=[]; current_tags=[]; current_units={}; current_type=None
+    for page_no,text in enumerate(pages,1):
+        tags,units,record_type=header_tags(text)
+        if tags:
+            current_tags=tags; current_units=units or current_units; current_type=record_type or current_type
+        upper=text.upper()
+        if "ALARM RECORD" in upper:
+            for raw in text.splitlines():
+                m=DATE_RE.match(raw.strip())
+                if m:
+                    alarms.append({"Date time":pd.to_datetime(m.group(1)+" "+m.group(2),dayfirst=True),"Alarm":clean_text(m.group(3)),"Source page":page_no})
+            continue
+        if not current_tags: continue
+        group_name=" + ".join(current_tags)
+        wide_groups.setdefault(group_name,[])
+        for raw in text.splitlines():
+            m=DATE_RE.match(raw.strip())
+            if not m: continue
+            tokens=m.group(3).split()
+            if len(tokens)<len(current_tags): continue
+            values=tokens[:len(current_tags)]
+            if not all(NUMBER_RE.match(v) for v in values): continue
+            status=clean_text(" ".join(tokens[len(current_tags):]))
+            dt=pd.to_datetime(m.group(1)+" "+m.group(2),dayfirst=True)
+            row={"Date time":dt,**{tag:float(v) for tag,v in zip(current_tags,values)},"Status":status,"Source page":page_no}
+            if (current_type or "Cycle")=="Event":
+                events.append(row)
+            else:
+                wide_groups[group_name].append(row)
+                for tag,v in zip(current_tags,values):
+                    long_rows.append({"Date time":dt,"Instrument tag":tag,"Value":float(v),"Unit":current_units.get(tag,""),"Step status":status,"Instrument group":group_name,"Source page":page_no})
+    wide={name:pd.DataFrame(rows).drop_duplicates(subset=["Date time"],keep="first").sort_values("Date time") for name,rows in wide_groups.items() if rows}
+    long_df=pd.DataFrame(long_rows)
+    if not long_df.empty: long_df=long_df.drop_duplicates(subset=["Date time","Instrument tag"],keep="first").sort_values(["Instrument tag","Date time"])
+    return wide,long_df,pd.DataFrame(events),pd.DataFrame(alarms)
+
+def safe_table(df,height=650):
+    view=df.copy().reset_index(drop=True)
+    for c in view.columns:
+        if pd.api.types.is_datetime64_any_dtype(view[c]): view[c]=view[c].dt.strftime("%d/%m/%Y %H:%M:%S").fillna("")
+        elif view[c].dtype=="object": view[c]=view[c].fillna("").astype(str)
+    st.dataframe(view,use_container_width=True,hide_index=True,height=height,row_height=31)
+
+st.title("ADAM Skid Process Report - Instrument Tagwise Extraction")
+st.caption("Extracts multi-section ADAM process reports and bifurcates data by instrument tag number. Data is displayed in memory only.")
+upload=st.sidebar.file_uploader("Upload ADAM Skid Process PDF",type=["pdf"])
+if not upload:
+    st.info("Upload the ADAM Skid Process report PDF to extract cycle data by instrument tag.")
+    st.stop()
+with st.spinner("Extracting all report pages and instrument groups..."):
+    pages=extract_pdf_pages(upload.getvalue())
+    meta=metadata_from_pages(pages)
+    groups,long_df,events,alarms=parse_process_report(pages)
+if long_df.empty:
+    st.error("No tagwise process rows were extracted. Confirm that the PDF contains searchable text and the Process Report layout.")
     st.stop()
 
-name=st.sidebar.selectbox("Active report",list(reports))
-r=reports[name]; data=r["Process Data"].copy(); tags=[x for x in r["tags"] if x in data]
-st.sidebar.success(f"Loaded as: {r["report_type"]}")
+tags=sorted(long_df["Instrument tag"].unique())
+selected_tag=st.sidebar.selectbox("Instrument tag number",tags)
+tag_df=long_df[long_df["Instrument tag"]==selected_tag].sort_values("Date time")
+statuses=sorted(tag_df["Step status"].dropna().astype(str).unique())
+chosen=st.sidebar.multiselect("Step status",statuses,default=statuses)
+tag_df=tag_df[tag_df["Step status"].astype(str).isin(chosen)]
 
-lo=data["Date time"].min().to_pydatetime(); hi=data["Date time"].max().to_pydatetime()
-window=st.sidebar.slider("Date/time window",lo,hi,(lo,hi),format="DD/MM/YY HH:mm")
-stages=sorted(data["Stage"].dropna().astype(str).unique())
-chosen=st.sidebar.multiselect("Stage",stages,default=stages)
-f=data[data["Date time"].between(pd.Timestamp(window[0]),pd.Timestamp(window[1])) & data["Stage"].astype(str).isin(chosen)]
+m1,m2,m3,m4=st.columns(4)
+m1.metric("Instrument tags",len(tags)); m2.metric("Total tagwise readings",f"{len(long_df):,}")
+m3.metric(f"{selected_tag} readings",f"{len(tag_df):,}"); m4.metric("Instrument groups",len(groups))
 
-st.subheader(name)
-a,b,c,d=st.columns(4)
-a.metric("Report type",r["report_type"]); b.metric("Rows",f"{len(f):,}")
-c.metric("Start",f["Date time"].min().strftime("%d %b %Y %H:%M") if len(f) else "-")
-d.metric("End",f["Date time"].max().strftime("%d %b %Y %H:%M") if len(f) else "-")
+summary=long_df.groupby(["Instrument tag","Unit"],dropna=False).agg(Records=("Value","size"),Start=("Date time","min"),End=("Date time","max"),Minimum=("Value","min"),Maximum=("Value","max"),Mean=("Value","mean")).reset_index()
 
-# Extraction continuity check. The table remains complete; only plots may be sampled.
-ordered=data.sort_values("Date time").reset_index(drop=True)
-gaps=ordered["Date time"].diff().dt.total_seconds().div(60)
-large_gaps=int((gaps > 2.1).sum())
-st.caption(
-    f"Extraction check: first record {ordered['Date time'].min().strftime('%d/%m/%Y %H:%M:%S')} | "
-    f"last record {ordered['Date time'].max().strftime('%d/%m/%Y %H:%M:%S')} | "
-    f"{len(ordered):,} total rows | {large_gaps} intervals longer than 2.1 minutes."
-)
-
-tabs=st.tabs(["Overview","Trends","Stages","Events & alarms","All data","Metadata"])
+tabs=st.tabs(["Selected tag","Tag summary","Instrument groups","All tagwise data","Events & alarms","Metadata"])
 with tabs[0]:
-    default=[x for x in ["TICR066","TT-01","TT-02","TICR067","TICR034","PT01","PT-01"] if x in tags]
-    plot_df=chart_data(f)
-    long=plot_df.melt(id_vars="Date time",value_vars=default,var_name="Tag",value_name="Value") if default else pd.DataFrame()
-    if not long.empty: st.plotly_chart(px.line(long,x="Date time",y="Value",color="Tag",title="Key process trends"),use_container_width=True)
-    counts=f["Stage"].value_counts().rename_axis("Stage").reset_index(name="Records")
-    st.plotly_chart(px.bar(counts.head(20),x="Records",y="Stage",orientation="h",title="Records by stage"),use_container_width=True)
+    st.subheader(f"Instrument tag: {selected_tag}")
+    unit=tag_df["Unit"].dropna().astype(str).replace("",pd.NA).dropna().iloc[0] if tag_df["Unit"].astype(str).str.len().gt(0).any() else ""
+    plot_df=tag_df.iloc[::max(1,len(tag_df)//3000)]
+    fig=px.line(plot_df,x="Date time",y="Value",title=f"{selected_tag} trend",labels={"Value":f"Value ({unit})" if unit else "Value"})
+    st.plotly_chart(fig,use_container_width=True)
+    safe_table(tag_df[["Date time","Instrument tag","Value","Unit","Step status","Source page"]])
 with tabs[1]:
-    selected=st.multiselect("Select process tags",tags,default=default)
-    if selected:
-        plot_df=chart_data(f)
-        long=plot_df.melt(id_vars="Date time",value_vars=selected,var_name="Tag",value_name="Value")
-        st.plotly_chart(px.line(long,x="Date time",y="Value",color="Tag",title="Interactive process trends"),use_container_width=True)
+    safe_table(summary,height=600)
 with tabs[2]:
-    trans=f.loc[f["Stage"].astype(str).ne(f["Stage"].astype(str).shift()),["Date time","Stage"]].copy()
-    trans["Duration to next transition (min)"]=(trans["Date time"].shift(-1)-trans["Date time"]).dt.total_seconds()/60
-    display_table(trans, "transitions", height=520, page_size=300)
+    group_name=st.selectbox("Instrument group",list(groups.keys()))
+    st.caption("One combined table for the selected instrument group.")
+    safe_table(groups[group_name])
 with tabs[3]:
-    col1,col2=st.columns(2)
-    with col1: st.subheader("Events"); display_table(r["Events"], "events", height=520, page_size=300)
-    with col2: st.subheader("Alarms"); display_table(r["Alarms"], "alarms", height=520, page_size=300)
-with tabs[4]:
-    search=st.text_input("Search displayed process rows")
-    view=f
+    search=st.text_input("Search tag, status, unit or timestamp")
+    view=long_df
     if search: view=view[view.astype(str).apply(lambda x:x.str.contains(search,case=False,na=False)).any(axis=1)]
-    display_table(view, "all_data", height=650, page_size=500)
-with tabs[5]: display_table(r["Metadata"], "metadata", height=420, page_size=100)
+    safe_table(view)
+with tabs[4]:
+    a,b=st.columns(2)
+    with a:
+        st.subheader(f"Event records ({len(events):,})")
+        safe_table(events,height=520) if not events.empty else st.info("No event records extracted.")
+    with b:
+        st.subheader(f"Alarm records ({len(alarms):,})")
+        safe_table(alarms,height=520) if not alarms.empty else st.info("No alarm records extracted.")
+with tabs[5]:
+    safe_table(pd.DataFrame(meta.items(),columns=["Field","Value"]),height=430)
 
-if len(reports)>1:
-    st.divider(); st.subheader("Uploaded report comparison")
-    comparison=[]
-    for n,x in reports.items():
-        q=x["Process Data"]
-        comparison.append({"File":n,"Report type":x["report_type"],"Rows":len(q),"Start":q["Date time"].min(),"End":q["Date time"].max(),"Alarms":len(x["Alarms"]),"Events":len(x["Events"])})
-    display_table(pd.DataFrame(comparison), "comparison", height=300, page_size=100)
-st.caption("Privacy mode: PDFs are parsed in memory for the active Streamlit session. The app does not create or save Excel/CSV files.")
+st.caption("The app does not save Excel/CSV files. It keeps parsed data only for the active Streamlit session.")
