@@ -7,10 +7,28 @@ import plotly.express as px
 import streamlit as st
 import pdfplumber
 
+
+def clear_application_cache():
+    """Clear parsed-report caches and temporary selection state."""
+    st.cache_data.clear()
+    st.cache_resource.clear()
+    for key in list(st.session_state.keys()):
+        if key.startswith(("report_type_", "combined_", "flow_", "page_")):
+            del st.session_state[key]
+    st.session_state["cache_cleared_notice"] = True
+
 st.set_page_config(page_title="ADAM Process Report - Tagwise Extraction", page_icon="📊", layout="wide")
+
+st.sidebar.header("Application controls")
+if st.sidebar.button("Clear application cache", type="primary", use_container_width=True, help="Clears parsed-report data, Streamlit resources, and temporary report selections, then reloads the app."):
+    clear_application_cache()
+    st.rerun()
+if st.session_state.pop("cache_cleared_notice", False):
+    st.sidebar.success("Application cache cleared. Please upload the PDF again.")
+st.sidebar.caption("Use after updating app.py, changing report type, or seeing an old cached parsing error.")
 DATE_RE = re.compile(r"^(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2}:\d{2})\s+(.+)$")
 NUMBER_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
-TAG_RE = re.compile(r"^(?:LSICR|PICR|TICR|TA|TLP|RLS|CP|PT|TT|XV)[A-Z0-9-]*$", re.I)
+TAG_RE = re.compile(r"^(?:LSICR|PICR|TICR|TA|TLP|RLS|CP|PT|TT|XV|DP|QI?CR|CI?CR|MFM)[A-Z0-9_-]*$", re.I)
 
 
 # HMI tag naming derived from the supplied Octreotide Skid HMI screens.
@@ -366,6 +384,41 @@ def metadata_from_pages(pages):
         "PDF pages": len(pages),
     }
 
+TAG_ALIASES = {
+    "PICR12":"PICR012", "PICR012":"PICR012",
+    "PICR15":"PICR15", "PICR015":"PICR15",
+    "PICR16":"PICR16", "PICR016":"PICR16",
+    "PICR17":"PICR17", "PICR017":"PICR17",
+    "PICR18":"PICR18", "PICR018":"PICR18",
+    "PICR19":"PICR19", "PICR019":"PICR19",
+    "TLP01":"TLP001", "TLP001":"TLP001",
+    "TLP02":"TLP002", "TLP002":"TLP002",
+}
+
+def canonical_tag(tag):
+    raw=str(tag or "").strip().replace("\\_","_")
+    return TAG_ALIASES.get(raw.upper(),raw.upper())
+
+def scan_report_tag_headers(pages):
+    """Inventory every tag printed in cycle/event headers, even if no data row is parsed."""
+    found=[]
+    for page_no,text in enumerate(pages,1):
+        lines=text.splitlines()
+        section="Event" if "EVENT RECORD" in text.upper() else ("Cycle" if "CYCLE RECORD" in text.upper() else "Other")
+        for line in lines:
+            u=line.upper()
+            if "DATE TIME" in u and ("STEP STATUS" in u or "EVENT STATUS" in u):
+                right=re.split(r"DATE TIME",line,flags=re.I,maxsplit=1)[1]
+                right=re.sub(r"(?:STEP|EVENT) STATUS.*$","",right,flags=re.I)
+                for candidate in [x.strip() for x in re.split(r"\\s{2,}",right) if x.strip()]:
+                    if TAG_RE.match(candidate):
+                        found.append({"Raw report tag":candidate,"Canonical tag":canonical_tag(candidate),"Section":section,"Header page":page_no})
+            if re.match(r"^\\s*Tag\\s+",line,re.I):
+                for candidate in [x.strip() for x in re.split(r"\\s{2,}",line.strip())[1:] if x.strip()]:
+                    if TAG_RE.match(candidate):
+                        found.append({"Raw report tag":candidate,"Canonical tag":canonical_tag(candidate),"Section":section,"Header page":page_no})
+    return pd.DataFrame(found).drop_duplicates() if found else pd.DataFrame(columns=["Raw report tag","Canonical tag","Section","Header page"])
+
 def header_tags(page_text):
     lines=page_text.splitlines()
     tags=[]; units={}; record_type=None
@@ -377,13 +430,13 @@ def header_tags(page_text):
             right=re.split(r"DATE TIME", line, flags=re.I, maxsplit=1)[1]
             right=re.sub(r"(?:STEP|EVENT) STATUS.*$", "", right, flags=re.I)
             candidates=[x.strip() for x in re.split(r"\s{2,}", right) if x.strip()]
-            tags=[x for x in candidates if TAG_RE.match(x)]
+            tags=[canonical_tag(x) for x in candidates if TAG_RE.match(x)]
             break
     # Prefer the explicit Tag row, which is authoritative.
     for line in lines:
         if re.match(r"^\s*Tag\s+", line, re.I):
             candidates=[x.strip() for x in re.split(r"\s{2,}", line.strip())[1:] if x.strip()]
-            explicit=[x for x in candidates if TAG_RE.match(x)]
+            explicit=[canonical_tag(x) for x in candidates if TAG_RE.match(x)]
             if explicit: tags=explicit
         if re.match(r"^\s*Unit\s+", line, re.I) and tags:
             vals=[x.strip() for x in re.split(r"\s{2,}", line.strip())[1:] if x.strip()]
@@ -549,6 +602,7 @@ for idx,uploaded in enumerate(uploads):
 @st.cache_data(show_spinner=False, max_entries=2, ttl=1800)
 def process_uploaded_report(file_name, raw, selected_type):
     pages=extract_pdf_pages(raw)
+    tag_inventory=scan_report_tag_headers(pages)
     detected_type=selected_type
     adam_score=0; omca_score=0
     meta=metadata_from_pages(pages)
@@ -571,9 +625,15 @@ def process_uploaded_report(file_name, raw, selected_type):
             if c in long_df:
                 long_df[c]=long_df[c].astype("string").fillna("")
     long_df=add_hmi_tag_names(long_df)
+    if not tag_inventory.empty:
+        extracted_counts=(long_df.groupby("Instrument tag",as_index=False).size().rename(columns={"size":"Extracted readings"}) if not long_df.empty else pd.DataFrame(columns=["Instrument tag","Extracted readings"]))
+        tag_inventory=tag_inventory.merge(extracted_counts,left_on="Canonical tag",right_on="Instrument tag",how="left")
+        tag_inventory["Extracted readings"]=tag_inventory["Extracted readings"].fillna(0).astype(int)
+        tag_inventory["Extraction status"]=tag_inventory["Extracted readings"].gt(0).map({True:"Extracted",False:"Header found, no data rows parsed"})
+        tag_inventory=tag_inventory.drop(columns=["Instrument tag"],errors="ignore")
     pages.clear()
     return {
-        "file_name":file_name,"detected_type":detected_type,
+        "file_name":file_name,"detected_type":detected_type,"tag_inventory":tag_inventory,
         "adam_score":adam_score,"omca_score":omca_score,
         "meta":meta,"groups":groups,"long_df":long_df,"events":events,"alarms":alarms,"error":error,
     }
@@ -596,6 +656,8 @@ for r in reports:
     summary_rows.append({
         "File name":r["file_name"],"Selected report type":r.get("detected_type","Unknown"),
         "Instrument tags":d["Instrument tag"].nunique() if not d.empty else 0,
+        "Header tags":r.get("tag_inventory",pd.DataFrame()).get("Canonical tag",pd.Series(dtype=str)).nunique(),
+        "Header tags missing data":int((r.get("tag_inventory",pd.DataFrame()).get("Extracted readings",pd.Series(dtype=int))==0).sum()),
         "Tagwise readings":len(d),"Events":len(r.get("events",pd.DataFrame())),
         "Alarms":len(r.get("alarms",pd.DataFrame())),"Status":"Error" if r.get("error") else "Processed",
         "Message":r.get("error") or "",
@@ -612,7 +674,7 @@ if not valid:
 report_names=[r["file_name"] for r in valid]
 active_name=st.sidebar.selectbox("Active report",report_names)
 r=next(x for x in valid if x["file_name"]==active_name)
-long_df=r["long_df"]; groups=r["groups"]; events=r["events"]; alarms=r["alarms"]; meta=r["meta"]
+long_df=r["long_df"]; groups=r["groups"]; events=r["events"]; alarms=r["alarms"]; meta=r["meta"]; tag_inventory=r.get("tag_inventory",pd.DataFrame())
 flow_min_duration=st.sidebar.number_input("Minimum transfer duration (min)",min_value=1.0,max_value=30.0,value=2.0,step=1.0)
 flow_min_change=st.sidebar.number_input("Minimum net weight change (kg)",min_value=0.05,max_value=20.0,value=0.25,step=0.05)
 flow_smoothing=st.sidebar.select_slider("Weight smoothing points",options=[1,3,5,7],value=3)
@@ -657,7 +719,7 @@ m3.metric("Active report tags",len(tags)); m4.metric("Active tag readings",f"{le
 summary=(long_df.groupby(["Instrument tag","HMI equipment","HMI measurement name","Unit"],dropna=False,observed=True,as_index=False)
     .agg(Records=("Value","size"),Start=("Date time","min"),End=("Date time","max"),Minimum=("Value","min"),Maximum=("Value","max"),Mean=("Value","mean")))
 
-tabs=st.tabs(["Selected tag","Tag summary","Transfer flowrate","HMI tag dictionary","Instrument groups","All tagwise data","Events & alarms","Metadata"])
+tabs=st.tabs(["Selected tag","Tag summary","Extraction audit","Transfer flowrate","HMI tag dictionary","Instrument groups","All tagwise data","Events & alarms","Metadata"])
 with tabs[0]:
     selected_equipment=tag_df["HMI equipment"].iloc[0] if not tag_df.empty else ""
     selected_measurement=tag_df["HMI measurement name"].iloc[0] if not tag_df.empty else ""
@@ -667,10 +729,17 @@ with tabs[0]:
     plot_df=tag_df.iloc[::max(1,len(tag_df)//3000)]
     fig=px.line(plot_df,x="Date time",y="Value",title=f"{selected_tag} trend",labels={"Value":f"Value ({unit})" if unit else "Value"})
     st.plotly_chart(fig,use_container_width=True)
-    safe_table(tag_df[["Date time","Instrument tag","HMI equipment","HMI measurement name","Value","Unit","Step status","Source page"]])
+    safe_table(tag_df[["Date time","Instrument tag","HMI equipment","HMI measurement name","Value","Unit","Step status","Source page"]],max_rows=max(3000,len(tag_df)),key="selected_tag_complete")
 with tabs[1]:
     safe_table(summary,height=600)
 with tabs[2]:
+    st.subheader("Report tag extraction audit")
+    st.caption("This table distinguishes tags that are printed in the PDF report from tags that exist only on the HMI. HMI mapping cannot create historical values that are absent from the PDF.")
+    if tag_inventory.empty:
+        st.info("No cycle/event tag headers were found in this report format.")
+    else:
+        safe_table(tag_inventory.sort_values(["Extraction status","Canonical tag"]),height=650,max_rows=10000,key="tag_audit")
+with tabs[3]:
     st.subheader("Calculated material-transfer flowrate from vessel weight")
     st.caption("Mass flow is estimated from the slope of LSICR vessel weight: |Δweight| / Δtime. Negative slope is discharge; positive slope is receiving/charging. Results are mass flow only, not volumetric flow.")
     if flow_episodes.empty:
@@ -686,18 +755,18 @@ with tabs[2]:
             fig=px.line(plot,x="Date time",y="Transfer flowrate (kg/min)",color="Transfer direction",title=f"Calculated transfer flowrate: {flow_tag}")
             st.plotly_chart(fig,use_container_width=True)
             safe_table(point_view[["Date time","Instrument tag","Source vessel","Destination / route","Smoothed weight (kg)","Weight change (kg)","Interval (min)","Transfer direction","Transfer flowrate (kg/min)","Transfer flowrate (kg/h)","Step status"]],height=620)
-with tabs[3]:
+with tabs[4]:
     mapping=long_df[["Instrument tag","HMI equipment","HMI measurement name","Unit"]].drop_duplicates().sort_values(["HMI equipment","Instrument tag"])
     safe_table(mapping,height=650)
-with tabs[4]:
+with tabs[5]:
     group_name=st.selectbox("Instrument group",list(groups.keys()))
     safe_table(groups[group_name])
-with tabs[5]:
+with tabs[6]:
     search=st.text_input("Search tag, status, unit or timestamp")
     view=long_df
     if search: view=view[view.astype(str).apply(lambda x:x.str.contains(search,case=False,na=False)).any(axis=1)]
     safe_table(view)
-with tabs[6]:
+with tabs[7]:
     a,b=st.columns(2)
     with a:
         st.subheader(f"Event records ({len(events):,})")
@@ -705,7 +774,7 @@ with tabs[6]:
     with b:
         st.subheader(f"Alarm records ({len(alarms):,})")
         safe_table(alarms,height=520) if not alarms.empty else st.info("No alarm records extracted.")
-with tabs[7]:
+with tabs[8]:
     safe_table(pd.DataFrame(meta.items(),columns=["Field","Value"]),height=430)
 
 st.caption("All PDFs are processed independently in memory. The app does not create or store Excel/CSV files.")
