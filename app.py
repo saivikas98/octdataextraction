@@ -492,7 +492,7 @@ def safe_table(df,height=650,max_rows=3000,key=None):
     st.dataframe(view,use_container_width=True,hide_index=True,height=height,row_height=31,key=key)
 
 st.title("Universal ADAM and OMCA ANFDA Multi-Report Extractor")
-st.caption("Upload multiple ADAM Skid Process and OMCA ANFDA/ANFD-2 drying reports together. Each PDF is detected automatically and processed independently in memory.")
+st.caption("Upload multiple reports, manually select ADAM or OMCA ANFDA for each PDF, and process without report-type detection delay.")
 uploads=st.sidebar.file_uploader(
     "Upload multiple report PDFs",
     type=["pdf"],
@@ -512,22 +512,35 @@ if large:
     st.error("Each PDF must be 50 MB or smaller: "+", ".join(large))
     st.stop()
 
+st.sidebar.subheader("Select report type for each PDF")
+report_type_by_file={}
+for idx,uploaded in enumerate(uploads):
+    filename=uploaded.name.lower()
+    default_index=1 if any(x in filename for x in ["drying","trial batch","anfd-2","omca"]) else 0
+    report_type_by_file[uploaded.name]=st.sidebar.selectbox(
+        uploaded.name,
+        ["ADAM Skid Process Report","OMCA ANFDA Drying Report"],
+        index=default_index,
+        key=f"report_type_{idx}_{uploaded.name}_{uploaded.size}",
+        help="ADAM: Process Cycle reports with full date/time and multiple LSICR/PICR/TICR groups. OMCA ANFDA: ANFD-2 Drying reports with Record, Time, TT-01, TT-02, PT-01, Filter_Pos, Agit_Rpm and Agit_Pos."
+    )
+
 @st.cache_data(show_spinner=False, max_entries=2, ttl=1800)
-def process_uploaded_report(file_name, raw):
+def process_uploaded_report(file_name, raw, selected_type):
     pages=extract_pdf_pages(raw)
-    detected_type,adam_score,omca_score,adam_markers,omca_markers=detect_report_type(pages)
+    detected_type=selected_type
+    adam_score=0; omca_score=0
     meta=metadata_from_pages(pages)
     error=None
     groups={}; long_df=pd.DataFrame(); events=pd.DataFrame(); alarms=pd.DataFrame()
-    if detected_type=="ADAM Skid Process Report":
+    if selected_type=="ADAM Skid Process Report":
         groups,long_df,events,alarms=parse_process_report(pages)
-    elif detected_type=="OMCA ANFDA Drying Report":
+    elif selected_type=="OMCA ANFDA Drying Report":
         groups,long_df,events,alarms=parse_omca_anfd_report(pages)
     else:
-        error="Automatic detection was inconclusive."
+        error="Select a valid report type."
     meta["File name"]=file_name
-    meta["Detected report type"]=detected_type
-    meta["Detection score"]=f"ADAM {adam_score}/5 | OMCA {omca_score}/5"
+    meta["Selected report type"]=selected_type
     if not long_df.empty and "Source report" not in long_df.columns:
         long_df.insert(0,"Source report",file_name)
     if not long_df.empty:
@@ -540,16 +553,16 @@ def process_uploaded_report(file_name, raw):
     return {
         "file_name":file_name,"detected_type":detected_type,
         "adam_score":adam_score,"omca_score":omca_score,
-        "adam_markers":adam_markers,"omca_markers":omca_markers,
         "meta":meta,"groups":groups,"long_df":long_df,"events":events,"alarms":alarms,"error":error,
     }
 
 reports=[]
 progress=st.progress(0,text="Starting report processing...")
 for i,uploaded in enumerate(uploads):
-    progress.progress(i/len(uploads),text=f"Processing {uploaded.name} ({i+1} of {len(uploads)})")
+    selected_type=report_type_by_file[uploaded.name]
+    progress.progress(i/len(uploads),text=f"Processing {uploaded.name} as {selected_type} ({i+1} of {len(uploads)})")
     try:
-        reports.append(process_uploaded_report(uploaded.name,uploaded.getvalue()))
+        reports.append(process_uploaded_report(uploaded.name,uploaded.getvalue(),selected_type))
     except Exception as exc:
         reports.append({"file_name":uploaded.name,"detected_type":"Failed","error":str(exc),"long_df":pd.DataFrame(),"events":pd.DataFrame(),"alarms":pd.DataFrame(),"groups":{},"meta":{"File name":uploaded.name},"adam_score":0,"omca_score":0})
     gc.collect()
@@ -559,7 +572,7 @@ summary_rows=[]
 for r in reports:
     d=r.get("long_df",pd.DataFrame())
     summary_rows.append({
-        "File name":r["file_name"],"Detected report type":r.get("detected_type","Unknown"),
+        "File name":r["file_name"],"Selected report type":r.get("detected_type","Unknown"),
         "Instrument tags":d["Instrument tag"].nunique() if not d.empty else 0,
         "Tagwise readings":len(d),"Events":len(r.get("events",pd.DataFrame())),
         "Alarms":len(r.get("alarms",pd.DataFrame())),"Status":"Error" if r.get("error") else "Processed",
@@ -582,7 +595,7 @@ flow_min_duration=st.sidebar.number_input("Minimum transfer duration (min)",min_
 flow_min_change=st.sidebar.number_input("Minimum net weight change (kg)",min_value=0.05,max_value=20.0,value=0.25,step=0.05)
 flow_smoothing=st.sidebar.select_slider("Weight smoothing points",options=[1,3,5,7],value=3)
 flow_points,flow_episodes=calculate_transfer_flowrates(long_df,flow_min_duration,flow_min_change,flow_smoothing)
-st.sidebar.success(f"Detected: {r['detected_type']}")
+st.sidebar.success(f"Processing as: {r['detected_type']}")
 
 combine_same_type=st.sidebar.checkbox("Combine all processed reports",value=False)
 if combine_same_type:
