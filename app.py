@@ -172,39 +172,90 @@ def safe_table(df,height=650):
         elif view[c].dtype=="object": view[c]=view[c].fillna("").astype(str)
     st.dataframe(view,use_container_width=True,hide_index=True,height=height,row_height=31)
 
-st.title("Universal ADAM and OMCA ANFDA Report Extractor")
-st.caption("Automatically detects ADAM Skid Process and OMCA ANFDA/ANFD-2 drying reports, then bifurcates data by instrument tag number.")
-upload=st.sidebar.file_uploader("Upload report PDF",type=["pdf"])
-if not upload:
-    st.info("Upload a supported ADAM or OMCA ANFDA PDF. The report format will be detected automatically.")
+st.title("Universal ADAM and OMCA ANFDA Multi-Report Extractor")
+st.caption("Upload multiple ADAM Skid Process and OMCA ANFDA/ANFD-2 drying reports together. Each PDF is detected automatically and processed independently in memory.")
+uploads=st.sidebar.file_uploader(
+    "Upload multiple report PDFs",
+    type=["pdf"],
+    accept_multiple_files=True,
+    help="You can upload ADAM and OMCA ANFDA reports together."
+)
+if not uploads:
+    st.info("Upload one or more supported PDFs. Report formats will be detected automatically.")
     st.stop()
-with st.spinner("Detecting report type and extracting instrument tags..."):
-    pages=extract_pdf_pages(upload.getvalue())
+
+@st.cache_data(show_spinner=False)
+def process_uploaded_report(file_name, raw):
+    pages=extract_pdf_pages(raw)
     detected_type,adam_score,omca_score,adam_markers,omca_markers=detect_report_type(pages)
     meta=metadata_from_pages(pages)
-
-if detected_type=="Unknown":
-    st.error("The report type could not be identified reliably.")
-    with st.expander("Detection details"):
-        st.write({"ADAM score":adam_score,"OMCA score":omca_score,"ADAM markers":adam_markers,"OMCA markers":omca_markers})
-    manual_type=st.selectbox("Select the report type manually",["ADAM Skid Process Report","OMCA ANFDA Drying Report"])
-    if not st.button("Extract using selected type",type="primary"):
-        st.stop()
-    detected_type=manual_type
-
-st.sidebar.success(f"Detected: {detected_type}")
-with st.spinner(f"Extracting as {detected_type}..."):
+    error=None
+    groups={}; long_df=pd.DataFrame(); events=pd.DataFrame(); alarms=pd.DataFrame()
     if detected_type=="ADAM Skid Process Report":
         groups,long_df,events,alarms=parse_process_report(pages)
-    else:
+    elif detected_type=="OMCA ANFDA Drying Report":
         groups,long_df,events,alarms=parse_omca_anfd_report(pages)
+    else:
+        error="Automatic detection was inconclusive."
+    meta["File name"]=file_name
+    meta["Detected report type"]=detected_type
+    meta["Detection score"]=f"ADAM {adam_score}/5 | OMCA {omca_score}/5"
+    return {
+        "file_name":file_name,"pages":pages,"detected_type":detected_type,
+        "adam_score":adam_score,"omca_score":omca_score,
+        "adam_markers":adam_markers,"omca_markers":omca_markers,
+        "meta":meta,"groups":groups,"long_df":long_df,"events":events,"alarms":alarms,"error":error,
+    }
 
-if long_df.empty:
-    st.error(f"{detected_type} was detected, but no tagwise rows were extracted. Check that the PDF has a searchable text layer.")
+reports=[]
+progress=st.progress(0,text="Starting report processing...")
+for i,uploaded in enumerate(uploads):
+    progress.progress(i/len(uploads),text=f"Processing {uploaded.name} ({i+1} of {len(uploads)})")
+    try:
+        reports.append(process_uploaded_report(uploaded.name,uploaded.getvalue()))
+    except Exception as exc:
+        reports.append({"file_name":uploaded.name,"detected_type":"Failed","error":str(exc),"long_df":pd.DataFrame(),"events":pd.DataFrame(),"alarms":pd.DataFrame(),"groups":{},"meta":{"File name":uploaded.name},"adam_score":0,"omca_score":0})
+progress.progress(1.0,text=f"Processed {len(uploads)} report(s)")
+
+summary_rows=[]
+for r in reports:
+    d=r.get("long_df",pd.DataFrame())
+    summary_rows.append({
+        "File name":r["file_name"],"Detected report type":r.get("detected_type","Unknown"),
+        "Instrument tags":d["Instrument tag"].nunique() if not d.empty else 0,
+        "Tagwise readings":len(d),"Events":len(r.get("events",pd.DataFrame())),
+        "Alarms":len(r.get("alarms",pd.DataFrame())),"Status":"Error" if r.get("error") else "Processed",
+        "Message":r.get("error") or "",
+    })
+summary_df=pd.DataFrame(summary_rows)
+st.subheader("Batch processing summary")
+safe_table(summary_df,height=min(520,110+len(summary_df)*38))
+
+valid=[r for r in reports if not r.get("error") and not r.get("long_df",pd.DataFrame()).empty]
+if not valid:
+    st.error("None of the uploaded reports could be processed. Review the summary messages.")
     st.stop()
-meta["Detected report type"]=detected_type
-meta["Detection score"]=f"ADAM {adam_score}/5 | OMCA {omca_score}/5"
 
+report_names=[r["file_name"] for r in valid]
+active_name=st.sidebar.selectbox("Active report",report_names)
+r=next(x for x in valid if x["file_name"]==active_name)
+long_df=r["long_df"]; groups=r["groups"]; events=r["events"]; alarms=r["alarms"]; meta=r["meta"]
+st.sidebar.success(f"Detected: {r['detected_type']}")
+
+combine_same_type=st.sidebar.checkbox("Combine all processed reports",value=False)
+if combine_same_type:
+    combined=[]
+    for item in valid:
+        part=item["long_df"].copy(); part.insert(0,"Source report",item["file_name"]); part.insert(1,"Report type",item["detected_type"]); combined.append(part)
+    combined_long=pd.concat(combined,ignore_index=True)
+    st.subheader("Combined tagwise data across all uploaded reports")
+    st.caption(f"{len(valid)} reports | {combined_long['Instrument tag'].nunique()} unique tags | {len(combined_long):,} tagwise readings")
+    combined_tag=st.selectbox("Combined instrument tag",sorted(combined_long["Instrument tag"].unique()),key="combined_tag")
+    combined_view=combined_long[combined_long["Instrument tag"]==combined_tag].sort_values(["Source report","Date time"])
+    safe_table(combined_view,height=650)
+    st.divider()
+
+st.subheader(f"Active report: {active_name}")
 tags=sorted(long_df["Instrument tag"].unique())
 selected_tag=st.sidebar.selectbox("Instrument tag number",tags)
 tag_df=long_df[long_df["Instrument tag"]==selected_tag].sort_values("Date time")
@@ -213,8 +264,8 @@ chosen=st.sidebar.multiselect("Step status",statuses,default=statuses)
 tag_df=tag_df[tag_df["Step status"].astype(str).isin(chosen)]
 
 m1,m2,m3,m4=st.columns(4)
-m1.metric("Instrument tags",len(tags)); m2.metric("Total tagwise readings",f"{len(long_df):,}")
-m3.metric(f"{selected_tag} readings",f"{len(tag_df):,}"); m4.metric("Instrument groups",len(groups))
+m1.metric("Uploaded reports",len(uploads)); m2.metric("Processed reports",len(valid))
+m3.metric("Active report tags",len(tags)); m4.metric("Active tag readings",f"{len(tag_df):,}")
 
 summary=long_df.groupby(["Instrument tag","Unit"],dropna=False).agg(Records=("Value","size"),Start=("Date time","min"),End=("Date time","max"),Minimum=("Value","min"),Maximum=("Value","max"),Mean=("Value","mean")).reset_index()
 
@@ -230,7 +281,6 @@ with tabs[1]:
     safe_table(summary,height=600)
 with tabs[2]:
     group_name=st.selectbox("Instrument group",list(groups.keys()))
-    st.caption("One combined table for the selected instrument group.")
     safe_table(groups[group_name])
 with tabs[3]:
     search=st.text_input("Search tag, status, unit or timestamp")
@@ -248,4 +298,4 @@ with tabs[4]:
 with tabs[5]:
     safe_table(pd.DataFrame(meta.items(),columns=["Field","Value"]),height=430)
 
-st.caption("The app does not save Excel/CSV files. It keeps parsed data only for the active Streamlit session.")
+st.caption("All PDFs are processed independently in memory. The app does not create or store Excel/CSV files.")
