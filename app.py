@@ -721,7 +721,7 @@ def build_multi_sensor_profile(profile, tags, title=None, y_ranges=None):
         if g.empty:
             continue
         fig.add_trace(go.Scatter(
-            x=g["Elapsed time (min)"],
+            x=(g["Date time"]-d["Date time"].min()).dt.total_seconds()/60.0,
             y=g[tag],
             mode="lines+markers",
             name=tag,
@@ -987,6 +987,25 @@ def apply_plot_font_sizes(fig):
     fig.update_yaxes(title_font=dict(size=plot_axis_title_font),tickfont=dict(size=plot_tick_font))
     return fig
 
+def apply_editable_axis_titles(fig, plot_title, bottom_x_title, top_x_title, family_titles):
+    """Apply user-entered titles to existing Plotly axes without changing data."""
+    fig.update_layout(title_text=plot_title)
+    fig.update_xaxes(title_text=bottom_x_title, row=None, col=None)
+    if "xaxis2" in fig.layout:
+        fig.layout.xaxis2.title.text=top_x_title
+    # Preserve axis-family order used by multi-sensor plots.
+    existing_yaxes=[k for k in fig.layout if str(k).startswith("yaxis")]
+    for axis_name in existing_yaxes:
+        axis=getattr(fig.layout,axis_name)
+        old=(axis.title.text or "") if axis.title else ""
+        if "Weight" in old:
+            axis.title.text=family_titles.get("Weight (kg)",old)
+        elif "Temperature" in old:
+            axis.title.text=family_titles.get("Temperature (°C)",old)
+        elif "Pressure" in old:
+            axis.title.text=family_titles.get("Pressure (bar)",old)
+    return fig
+
 def show_plot_with_downloads(fig, chart_key, file_stem, height=None):
     """Display a Plotly chart with browser-side PNG and HTML downloads.
 
@@ -1043,7 +1062,7 @@ def safe_table(df,height=650,max_rows=3000,key=None):
     st.dataframe(view,width="stretch",hide_index=True,height=height,row_height=31,key=key)
 
 st.title("Universal ADAM and OMCA ANFDA Multi-Report Extractor")
-st.caption("Build: INTERACTIVE-MULTI-SENSOR-v12.1 | Elapsed-time KeyError fixed")
+st.caption("Build: INTERACTIVE-MULTI-SENSOR-v14 | Editable titles + graphical statistics")
 st.caption("Fast extraction uses Poppler pdftotext, then applies the selected ADAM or OMCA parser. Multiple reports are supported without automatic detection delay.")
 uploads=st.sidebar.file_uploader(
     "Upload multiple report PDFs",
@@ -1305,6 +1324,39 @@ with tabs[2]:
             selected_load=st.multiselect("Load-cell sensors",loadcell_tags,default=[x for x in ["LSICR004","LSICR005"] if x in loadcell_tags],key="multi_batch_load_v9")
         selected_tags=list(dict.fromkeys(selected_load+selected_pressure+selected_temp))[:12]
 
+        st.markdown("#### Editable plot and axis titles")
+        title_c1,title_c2,title_c3=st.columns(3)
+        with title_c1:
+            custom_plot_title=st.text_input(
+                "Plot title",
+                value="Process Profile with Step Segmentation",
+                key="custom_plot_title_v14",
+            )
+        with title_c2:
+            custom_x_title=st.text_input(
+                "Bottom X-axis title",
+                value="Elapsed time from sequence start (min)",
+                key="custom_x_title_v14",
+            )
+        with title_c3:
+            custom_top_x_title=st.text_input(
+                "Top X-axis title",
+                value="Actual date and time",
+                key="custom_top_x_title_v14",
+            )
+        ytitle_c1,ytitle_c2,ytitle_c3=st.columns(3)
+        with ytitle_c1:
+            custom_weight_y_title=st.text_input("Weight Y-axis title",value="Weight (kg)",key="custom_weight_y_title_v14")
+        with ytitle_c2:
+            custom_temperature_y_title=st.text_input("Temperature Y-axis title",value="Temperature (°C)",key="custom_temperature_y_title_v14")
+        with ytitle_c3:
+            custom_pressure_y_title=st.text_input("Pressure Y-axis title",value="Pressure (bar)",key="custom_pressure_y_title_v14")
+        custom_axis_titles={
+            "Weight (kg)":custom_weight_y_title,
+            "Temperature (°C)":custom_temperature_y_title,
+            "Pressure (bar)":custom_pressure_y_title,
+        }
+
         st.markdown("#### Manual Y-axis limits")
         manual_y_axis=st.checkbox(
             "Set Y-axis minimum and maximum manually",
@@ -1349,20 +1401,26 @@ with tabs[2]:
             st.info("Select at least one sensor.")
         elif len(selected_batches)>1:
             if plot_mode.startswith("Multiple"):
-                fig=build_cross_batch_sensor_profile(chronological,selected_tags,f"{', '.join(selected_batches)} | Multi-Sensor Cross-Batch Profile",y_ranges=y_axis_ranges)
+                fig=build_cross_batch_sensor_profile(chronological,selected_tags,custom_plot_title,y_ranges=y_axis_ranges)
+                fig=apply_editable_axis_titles(fig,custom_plot_title,custom_x_title,custom_top_x_title,custom_axis_titles)
                 show_plot_with_downloads(fig,"cross_batch_multi_v9",f"{'_'.join(selected_batches)}_multi_sensor",740)
             else:
                 for tag in selected_tags:
-                    fig=build_cross_batch_sensor_profile(chronological,[tag],f"{tag} Cross-Batch Profile",y_ranges=y_axis_ranges)
+                    individual_title=f"{custom_plot_title} | {tag}"
+                    fig=build_cross_batch_sensor_profile(chronological,[tag],individual_title,y_ranges=y_axis_ranges)
+                    fig=apply_editable_axis_titles(fig,individual_title,custom_x_title,custom_top_x_title,custom_axis_titles)
                     show_plot_with_downloads(fig,f"cross_batch_{tag}_v9",f"{'_'.join(selected_batches)}_{tag}",700)
         else:
             one=chronological[chronological["Batch"].astype(str)==selected_batches[0]].copy()
             if plot_mode.startswith("Multiple"):
-                fig=build_multi_sensor_profile(one,selected_tags,f"{selected_batches[0]} | Multi-Sensor Process Profile",y_ranges=y_axis_ranges)
+                fig=build_multi_sensor_profile(one,selected_tags,custom_plot_title,y_ranges=y_axis_ranges)
+                fig=apply_editable_axis_titles(fig,custom_plot_title,custom_x_title,custom_top_x_title,custom_axis_titles)
                 show_plot_with_downloads(fig,"single_batch_multi_v9",f"{selected_batches[0]}_multi_sensor",740)
             else:
                 for tag in selected_tags:
-                    fig=build_single_sensor_profile(one,tag,f"{selected_batches[0]} | {tag} Process Profile",y_range=y_axis_ranges.get(tag))
+                    individual_title=f"{custom_plot_title} | {tag}"
+                    fig=build_single_sensor_profile(one,tag,individual_title,y_range=y_axis_ranges.get(tag))
+                    fig=apply_editable_axis_titles(fig,individual_title,custom_x_title,custom_top_x_title,custom_axis_titles)
                     show_plot_with_downloads(fig,f"single_batch_{tag}_v9",f"{selected_batches[0]}_{tag}",700)
         display_columns=["Source report","Batch","Date time","Elapsed time (min)","Step status"]+selected_tags
         safe_table(chronological[display_columns],height=650,max_rows=max(3000,len(chronological)),key="multi_batch_profile_table_v9")
@@ -1453,6 +1511,86 @@ with tabs[2]:
             stat_m2.metric("Temperature sensors",temperature_statistics["Temperature sensor"].nunique())
             stat_m3.metric("Process steps",temperature_statistics["Step status"].nunique())
             stat_m4.metric("Statistical rows",len(temperature_statistics))
+            st.markdown("#### Graphical temperature-statistics analysis")
+            statistic_metric=st.selectbox(
+                "Statistic to graph",
+                ["Mean","Minimum","Maximum","Standard_deviation","Range","%RSD"],
+                key="temperature_statistic_metric_v14",
+            )
+            statistic_chart_type=st.radio(
+                "Statistical plot type",
+                ["Mean with minimum-maximum band","Grouped bar chart","Heatmap"],
+                horizontal=True,
+                key="temperature_statistic_chart_type_v14",
+            )
+            statistics_plot_title=st.text_input(
+                "Statistical plot title",
+                value="Temperature Statistics Across Process Steps",
+                key="temperature_statistics_title_v14",
+            )
+
+            if statistic_chart_type=="Mean with minimum-maximum band":
+                stats_fig=go.Figure()
+                palette=px.colors.qualitative.Plotly+px.colors.qualitative.Safe
+                for profile_i,((batch_name,sensor_tag),group) in enumerate(
+                    temperature_statistics.groupby(["Batch","Temperature sensor"],sort=False)
+                ):
+                    color=palette[profile_i%len(palette)]
+                    label=f"{batch_name} | {sensor_tag}"
+                    group=group.copy()
+                    stats_fig.add_trace(go.Scatter(
+                        x=group["Step status"],y=group["Maximum"],mode="lines",
+                        line=dict(width=0),legendgroup=label,showlegend=False,hoverinfo="skip",
+                    ))
+                    stats_fig.add_trace(go.Scatter(
+                        x=group["Step status"],y=group["Minimum"],mode="lines",
+                        line=dict(width=0),fill="tonexty",fillcolor=color,
+                        opacity=0.18,legendgroup=label,showlegend=False,
+                        hovertemplate="Step=%{x}<br>Minimum=%{y:.3f} °C<extra></extra>",
+                    ))
+                    stats_fig.add_trace(go.Scatter(
+                        x=group["Step status"],y=group["Mean"],mode="lines+markers",
+                        name=label,legendgroup=label,line=dict(color=color,width=2.5),marker=dict(size=8),
+                        customdata=group[["Minimum","Maximum","Standard_deviation","Count"]].to_numpy(),
+                        hovertemplate=("Step=%{x}<br>Mean=%{y:.3f} °C<br>Minimum=%{customdata[0]:.3f} °C"
+                                       "<br>Maximum=%{customdata[1]:.3f} °C<br>SD=%{customdata[2]:.3f} °C"
+                                       "<br>Count=%{customdata[3]}<extra></extra>"),
+                    ))
+                stats_fig.update_layout(
+                    title=statistics_plot_title,xaxis_title="Process step",yaxis_title="Temperature (°C)",
+                    template="plotly_white",height=650,hovermode="x unified",xaxis_tickangle=-35,
+                    legend_title="Batch | Sensor",margin=dict(b=190),
+                )
+            elif statistic_chart_type=="Grouped bar chart":
+                chart_data=temperature_statistics.copy()
+                chart_data["Batch | Sensor"]=chart_data["Batch"].astype(str)+" | "+chart_data["Temperature sensor"].astype(str)
+                stats_fig=px.bar(
+                    chart_data,x="Step status",y=statistic_metric,color="Batch | Sensor",barmode="group",
+                    error_y="Standard_deviation" if statistic_metric=="Mean" else None,
+                    hover_data=["Count","Minimum","Maximum","Mean","Standard_deviation","Range","%RSD"],
+                    title=statistics_plot_title,
+                    labels={"Step status":"Process step",statistic_metric:statistic_metric},
+                )
+                stats_fig.update_layout(template="plotly_white",height=650,xaxis_tickangle=-35,margin=dict(b=190))
+            else:
+                chart_data=temperature_statistics.copy()
+                chart_data["Batch | Sensor"]=chart_data["Batch"].astype(str)+" | "+chart_data["Temperature sensor"].astype(str)
+                heat=chart_data.pivot_table(index="Batch | Sensor",columns="Step status",values=statistic_metric,aggfunc="mean")
+                stats_fig=px.imshow(
+                    heat,aspect="auto",color_continuous_scale="RdYlBu_r",text_auto=".2f",
+                    title=statistics_plot_title,
+                    labels=dict(x="Process step",y="Batch | Sensor",color=statistic_metric),
+                )
+                stats_fig.update_layout(height=max(480,100+55*len(heat)),xaxis_tickangle=-35,margin=dict(b=190))
+
+            stats_fig=apply_plot_font_sizes(stats_fig)
+            show_plot_with_downloads(
+                stats_fig,
+                chart_key=f"temperature_statistics_{statistic_chart_type}_{statistic_metric}",
+                file_stem=f"temperature_statistics_{statistic_chart_type}_{statistic_metric}",
+                height=650,
+            )
+
             safe_table(
                 temperature_statistics,
                 height=650,
