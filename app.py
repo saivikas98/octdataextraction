@@ -1016,8 +1016,8 @@ if not uploads:
     st.stop()
 
 
-if len(uploads)>5:
-    st.error("Upload a maximum of 5 reports per processing run to avoid Streamlit Community Cloud memory exhaustion.")
+if len(uploads)>10:
+    st.error("Upload a maximum of 10 reports per processing run to avoid Streamlit Community Cloud memory exhaustion.")
     st.stop()
 large=[f.name for f in uploads if f.size>50*1024*1024]
 if large:
