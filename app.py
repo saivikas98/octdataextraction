@@ -670,6 +670,137 @@ def identify_profile_windows(data, selected_steps, gap_minutes=10):
         options.append({"id":window_id,"label":label,"start":start,"end":end,"gain":gain,"steps":steps})
     return d,options
 
+def build_multi_sensor_profile(profile, tags, title=None):
+    """Overlay multiple selected sensors in one interactive graph.
+
+    Sensors are assigned to separate Y-axis families so weight, temperature,
+    and pressure can be viewed together without forcing a common scale.
+    """
+    if profile.empty or not tags:
+        return go.Figure()
+
+    d=profile.sort_values("Date time").copy()
+    fig=go.Figure()
+    palette=px.colors.qualitative.Plotly + px.colors.qualitative.Safe + px.colors.qualitative.Set2
+
+    def sensor_family(tag):
+        upper=str(tag).upper()
+        if upper.startswith("LSICR"):
+            return "Weight (kg)"
+        if upper.startswith(("TICR","TT-")):
+            return "Temperature (°C)"
+        if upper.startswith(("PICR","PT-")):
+            return "Pressure (bar)"
+        return "Value"
+
+    families=[]
+    for tag in tags:
+        fam=sensor_family(tag)
+        if fam not in families:
+            families.append(fam)
+    axis_for={fam:("y" if i==0 else f"y{i+1}") for i,fam in enumerate(families)}
+
+    for i,tag in enumerate(tags):
+        if tag not in d.columns:
+            continue
+        g=d[["Date time",tag,"Batch","Step status"]].dropna(subset=[tag]).sort_values("Date time")
+        if g.empty:
+            continue
+        fig.add_trace(go.Scatter(
+            x=g["Date time"],
+            y=g[tag],
+            mode="lines+markers",
+            name=tag,
+            yaxis=axis_for[sensor_family(tag)],
+            line=dict(width=2.4,color=palette[i%len(palette)]),
+            marker=dict(size=5,color=palette[i%len(palette)]),
+            customdata=g[["Batch","Step status"]].astype(str).to_numpy(),
+            hovertemplate=(
+                f"Tag={tag}<br>Batch=%{{customdata[0]}}<br>"
+                "Step=%{customdata[1]}<br>Time=%{x|%d-%m-%Y %H:%M}<br>"
+                "Value=%{y:.3f}<extra></extra>"
+            ),
+        ))
+
+    # Highlight each contiguous process step across the complete graph.
+    step_frame=d[["Date time","Step status"]].drop_duplicates("Date time").sort_values("Date time").copy()
+    gap=step_frame["Date time"].diff().dt.total_seconds().div(60)
+    step_frame["_segment"]=(step_frame["Step status"].ne(step_frame["Step status"].shift())|gap.gt(5)).cumsum()
+    step_colors=["#DDF3EF","#EEEAF6","#DCECF7","#E9F6CF","#F1F1F1","#E9F7EA","#FFF4BF","#FDE8E8"]
+    status_order=[]
+    for _,seg in step_frame.groupby("_segment",sort=True):
+        status=str(seg["Step status"].iloc[0])
+        if status not in status_order:
+            status_order.append(status)
+        color=step_colors[status_order.index(status)%len(step_colors)]
+        fig.add_vrect(
+            x0=seg["Date time"].min(),
+            x1=seg["Date time"].max()+pd.Timedelta(minutes=1),
+            fillcolor=color,opacity=0.42,line_width=0,layer="below",
+        )
+
+    # Add square legend keys for process steps.
+    for i,status in enumerate(status_order):
+        fig.add_trace(go.Scatter(
+            x=[None],y=[None],mode="markers",name=status,
+            legendgroup=f"status_{i}",
+            marker=dict(size=13,symbol="square",color=step_colors[i%len(step_colors)]),
+            hoverinfo="skip",
+        ))
+
+    axis_layout={}
+    for i,fam in enumerate(families):
+        key="yaxis" if i==0 else f"yaxis{i+1}"
+        axis_layout[key]=dict(
+            title=fam,
+            showgrid=(i==0),
+            gridcolor="#E6E8EB",
+            zeroline=False,
+            fixedrange=False,
+            showspikes=True,
+            spikemode="across",
+            spikesnap="cursor",
+        )
+        if i>0:
+            axis_layout[key].update(
+                overlaying="y",
+                side="right",
+                position=max(0.78,1-(i-1)*0.08),
+            )
+
+    fig.update_layout(
+        title=dict(
+            text=title or "Multi-Sensor Process Profile with Step Segmentation",
+            x=0.5,xanchor="center",font=dict(size=23,color="#111111"),
+        ),
+        height=740,
+        template="plotly_white",
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        hovermode="x unified",
+        dragmode="zoom",
+        margin=dict(l=85,r=190,t=110,b=205),
+        legend=dict(
+            orientation="h",x=0.5,y=-0.27,xanchor="center",yanchor="top",
+            title=dict(text="Sensors and process status"),font=dict(size=10),
+        ),
+        xaxis=dict(
+            title="Date time",showgrid=True,gridcolor="#EEF0F2",tickformat="%d-%m %H:%M",
+            rangeslider=dict(visible=True,thickness=0.08),
+            rangeselector=dict(
+                buttons=[
+                    dict(count=10,label="10m",step="minute",stepmode="backward"),
+                    dict(count=30,label="30m",step="minute",stepmode="backward"),
+                    dict(count=1,label="1h",step="hour",stepmode="backward"),
+                    dict(step="all",label="All"),
+                ],x=0.0,y=1.10,
+            ),
+            showspikes=True,spikemode="across",spikesnap="cursor",spikethickness=1,
+        ),
+        **axis_layout,
+    )
+    return fig
+
 def build_single_sensor_profile(profile, tag, title=None):
     """Plot one sensor from sequence start to end with process-step highlighting."""
     if profile.empty or tag not in profile.columns:
@@ -797,7 +928,7 @@ def safe_table(df,height=650,max_rows=3000,key=None):
     st.dataframe(view,width="stretch",hide_index=True,height=height,row_height=31,key=key)
 
 st.title("Universal ADAM and OMCA ANFDA Multi-Report Extractor")
-st.caption("Build: INTERACTIVE-SINGLE-SENSOR-v7 | Zoom, pan, hover, range slider")
+st.caption("Build: INTERACTIVE-MULTI-SENSOR-v8 | Multiple sensors in one plot")
 st.caption("Fast extraction uses Poppler pdftotext, then applies the selected ADAM or OMCA parser. Multiple reports are supported without automatic detection delay.")
 uploads=st.sidebar.file_uploader(
     "Upload multiple report PDFs",
@@ -837,7 +968,7 @@ for idx,uploaded in enumerate(uploads):
     )
 
 @st.cache_data(show_spinner=False, max_entries=2, ttl=1800)
-def process_uploaded_report(file_name, raw, selected_type, parser_version="interactive-single-sensor-v7"):
+def process_uploaded_report(file_name, raw, selected_type, parser_version="interactive-multi-sensor-v8"):
     pages,extraction_engine,text_extraction_seconds=extract_pdf_pages(raw)
     tag_inventory=scan_report_tag_headers(pages)
     detected_type=selected_type
@@ -885,7 +1016,7 @@ if process_now:
         selected_type=report_type_by_file[uploaded.name]
         progress.progress(i/len(uploads),text=f"Extracting {uploaded.name} as {selected_type} ({i+1} of {len(uploads)})")
         try:
-            reports.append(process_uploaded_report(uploaded.name,uploaded.getvalue(),selected_type,"interactive-single-sensor-v7"))
+            reports.append(process_uploaded_report(uploaded.name,uploaded.getvalue(),selected_type,"interactive-multi-sensor-v8"))
         except Exception as exc:
             reports.append({"file_name":uploaded.name,"detected_type":"Failed","error":str(exc),"long_df":pd.DataFrame(),"events":pd.DataFrame(),"alarms":pd.DataFrame(),"groups":{},"meta":{"File name":uploaded.name},"adam_score":0,"omca_score":0})
         gc.collect()
@@ -1051,22 +1182,45 @@ with tabs[2]:
             m3.metric("Duration (min)",f"{selected['duration']:.0f}")
             m4.metric("Selected sensors",len(selected_tags))
 
-            max_charts=15
-            render_tags=selected_tags[:max_charts]
-            if len(selected_tags)>max_charts:
-                st.warning(f"{len(selected_tags)} sensors selected. The first {max_charts} graphs are shown to protect Streamlit stability.")
-            for tag in render_tags:
-                sensor_fig=build_single_sensor_profile(
+            plot_mode=st.radio(
+                "Plot mode",
+                ["Multiple selected sensors in one plot","Individual plot for each sensor"],
+                horizontal=True,
+                key="sensor_plot_mode_v8",
+            )
+            max_sensors=12
+            render_tags=selected_tags[:max_sensors]
+            if len(selected_tags)>max_sensors:
+                st.warning(
+                    f"{len(selected_tags)} sensors selected. The first {max_sensors} are rendered "
+                    "to protect Streamlit stability."
+                )
+
+            if plot_mode.startswith("Multiple"):
+                sensor_fig=build_multi_sensor_profile(
                     chronological,
-                    tag=tag,
-                    title=f"{selected_batch} | {tag} Process Profile with Step Segmentation",
+                    tags=render_tags,
+                    title=f"{selected_batch} | Multi-Sensor Process Profile with Step Segmentation",
                 )
                 show_plot_with_downloads(
                     sensor_fig,
-                    chart_key=f"single_sensor_v6_{selected_batch}_{tag}_{selected['start']:%Y%m%d%H%M}",
-                    file_stem=f"{selected_batch}_{tag}_segmented_{selected['start']:%Y%m%d_%H%M}",
-                    height=700,
+                    chart_key=f"multi_sensor_v8_{selected_batch}_{selected['start']:%Y%m%d%H%M}_{len(render_tags)}",
+                    file_stem=f"{selected_batch}_multi_sensor_segmented_{selected['start']:%Y%m%d_%H%M}",
+                    height=740,
                 )
+            else:
+                for tag in render_tags:
+                    sensor_fig=build_single_sensor_profile(
+                        chronological,
+                        tag=tag,
+                        title=f"{selected_batch} | {tag} Process Profile with Step Segmentation",
+                    )
+                    show_plot_with_downloads(
+                        sensor_fig,
+                        chart_key=f"single_sensor_v8_{selected_batch}_{tag}_{selected['start']:%Y%m%d%H%M}",
+                        file_stem=f"{selected_batch}_{tag}_segmented_{selected['start']:%Y%m%d_%H%M}",
+                        height=700,
+                    )
             display_columns=["Source report","Batch","Date time","Step status"]+render_tags
             safe_table(chronological[display_columns],height=650,max_rows=max(3000,len(chronological)),key=f"single_sensor_table_v6_{selected_batch}_{selected['start']:%Y%m%d%H%M}")
 
