@@ -680,6 +680,7 @@ def build_multi_sensor_profile(profile, tags, title=None):
         return go.Figure()
 
     d=profile.sort_values("Date time").copy()
+    d["Elapsed time (min)"]=(d["Date time"]-d["Date time"].min()).dt.total_seconds()/60
     fig=go.Figure()
     palette=px.colors.qualitative.Plotly + px.colors.qualitative.Safe + px.colors.qualitative.Set2
 
@@ -707,7 +708,7 @@ def build_multi_sensor_profile(profile, tags, title=None):
         if g.empty:
             continue
         fig.add_trace(go.Scatter(
-            x=g["Date time"],
+            x=g["Elapsed time (min)"],
             y=g[tag],
             mode="lines+markers",
             name=tag,
@@ -717,7 +718,7 @@ def build_multi_sensor_profile(profile, tags, title=None):
             customdata=g[["Batch","Step status"]].astype(str).to_numpy(),
             hovertemplate=(
                 f"Tag={tag}<br>Batch=%{{customdata[0]}}<br>"
-                "Step=%{customdata[1]}<br>Time=%{x|%d-%m-%Y %H:%M}<br>"
+                "Step=%{customdata[1]}<br>Elapsed=%{x:.1f} min<br>"
                 "Value=%{y:.3f}<extra></extra>"
             ),
         ))
@@ -734,8 +735,8 @@ def build_multi_sensor_profile(profile, tags, title=None):
             status_order.append(status)
         color=step_colors[status_order.index(status)%len(step_colors)]
         fig.add_vrect(
-            x0=seg["Date time"].min(),
-            x1=seg["Date time"].max()+pd.Timedelta(minutes=1),
+            x0=(seg["Date time"].min()-d["Date time"].min()).total_seconds()/60,
+            x1=(seg["Date time"].max()-d["Date time"].min()).total_seconds()/60+1,
             fillcolor=color,opacity=0.42,line_width=0,layer="below",
         )
 
@@ -768,6 +769,13 @@ def build_multi_sensor_profile(profile, tags, title=None):
                 position=max(0.78,1-(i-1)*0.08),
             )
 
+    tick_source=d.drop_duplicates("Elapsed time (min)").sort_values("Elapsed time (min)")
+    if len(tick_source)>8:
+        positions=[round(i*(len(tick_source)-1)/7) for i in range(8)]
+        tick_source=tick_source.iloc[positions]
+    tickvals=tick_source["Elapsed time (min)"].tolist()
+    ticktext=[pd.to_datetime(x).strftime("%d-%m-%Y %H:%M") for x in tick_source["Date time"]]
+
     fig.update_layout(
         title=dict(
             text=title or "Multi-Sensor Process Profile with Step Segmentation",
@@ -785,7 +793,7 @@ def build_multi_sensor_profile(profile, tags, title=None):
             title=dict(text="Sensors and process status"),font=dict(size=10),
         ),
         xaxis=dict(
-            title="Date time",showgrid=True,gridcolor="#EEF0F2",tickformat="%d-%m %H:%M",
+            title="Elapsed time from sequence start (min)",showgrid=True,gridcolor="#EEF0F2",
             rangeselector=dict(
                 buttons=[
                     dict(count=10,label="10m",step="minute",stepmode="backward"),
@@ -796,12 +804,13 @@ def build_multi_sensor_profile(profile, tags, title=None):
             ),
             showspikes=True,spikemode="across",spikesnap="cursor",spikethickness=1,
         ),
+        xaxis2=dict(title="Actual date and time",overlaying="x",side="top",tickmode="array",tickvals=tickvals,ticktext=ticktext,showgrid=False),
         **axis_layout,
     )
     return fig
 
 def build_cross_batch_sensor_profile(profile, tags, title):
-    """Overlay selected sensors and batches using elapsed time from sequence start."""
+    """Overlay selected batches with elapsed minutes below and actual date/time above."""
     if profile.empty or not tags:
         return go.Figure()
     fig=go.Figure()
@@ -835,16 +844,26 @@ def build_cross_batch_sensor_profile(profile, tags, title):
             ))
             trace_index+=1
 
+    # Secondary top X-axis: actual date/time labels corresponding to elapsed-time positions.
+    tick_source=(profile.sort_values("Elapsed time (min)")
+                 .drop_duplicates("Elapsed time (min)"))
+    if len(tick_source)>8:
+        positions=[round(i*(len(tick_source)-1)/7) for i in range(8)]
+        tick_source=tick_source.iloc[positions]
+    tickvals=tick_source["Elapsed time (min)"].tolist()
+    ticktext=[pd.to_datetime(x).strftime("%d-%m-%Y %H:%M") for x in tick_source["Date time"]]
+
     axis_layout={}
     for i,fam in enumerate(families):
         key="yaxis" if i==0 else f"yaxis{i+1}"
         axis_layout[key]=dict(title=fam,showgrid=(i==0),gridcolor="#E6E8EB",zeroline=False,fixedrange=False)
         if i>0: axis_layout[key].update(overlaying="y",side="right",position=max(.78,1-(i-1)*.08))
     fig.update_layout(
-        title=dict(text=title,x=.5,xanchor="center",font=dict(size=23)),height=740,
-        template="plotly_white",hovermode="x unified",dragmode="zoom",margin=dict(l=85,r=190,t=100,b=130),
+        title=dict(text=title,x=.5,xanchor="center",font=dict(size=23)),height=760,
+        template="plotly_white",hovermode="x unified",dragmode="zoom",margin=dict(l=85,r=190,t=145,b=140),
         legend=dict(orientation="h",x=.5,y=-.18,xanchor="center",yanchor="top",title="Batch | Sensor"),
         xaxis=dict(title="Elapsed time from sequence start (min)",showgrid=True,gridcolor="#EEF0F2",showspikes=True),
+        xaxis2=dict(title="Actual date and time",overlaying="x",side="top",tickmode="array",tickvals=tickvals,ticktext=ticktext,showgrid=False),
         **axis_layout,
     )
     return fig
@@ -854,6 +873,7 @@ def build_single_sensor_profile(profile, tag, title=None):
     if profile.empty or tag not in profile.columns:
         return go.Figure()
     d=profile.sort_values("Date time").copy()
+    d["Elapsed time (min)"]=(d["Date time"]-d["Date time"].min()).dt.total_seconds()/60
     d=d.dropna(subset=[tag])
     if d.empty:
         return go.Figure()
@@ -871,7 +891,7 @@ def build_single_sensor_profile(profile, tag, title=None):
     colors=px.colors.qualitative.Plotly
     fig=go.Figure()
     fig.add_trace(go.Scatter(
-        x=d["Date time"],y=d[tag],mode="lines+markers",name=tag,
+        x=d["Elapsed time (min)"],y=d[tag],mode="lines+markers",name=tag,
         line=dict(color="#315EFB",width=2.5),marker=dict(size=6,color="#315EFB"),
         customdata=d[["Batch","Step status"]].astype(str).to_numpy(),
         hovertemplate=f"Tag={tag}<br>Batch=%{{customdata[0]}}<br>Step=%{{customdata[1]}}<br>Time=%{{x|%d-%m-%Y %H:%M}}<br>Value=%{{y:.3f}} {unit}<extra></extra>",
@@ -888,7 +908,7 @@ def build_single_sensor_profile(profile, tag, title=None):
         if status not in status_order: status_order.append(status)
         color=step_colors[status_order.index(status)%len(step_colors)]
         x0=seg["Date time"].min(); x1=seg["Date time"].max()+pd.Timedelta(minutes=1)
-        fig.add_vrect(x0=x0,x1=x1,fillcolor=color,opacity=0.55,line_width=0,layer="below")
+        fig.add_vrect(x0=(x0-d["Date time"].min()).total_seconds()/60,x1=(x1-d["Date time"].min()).total_seconds()/60,fillcolor=color,opacity=0.55,line_width=0,layer="below")
 
     # Add process-status legend entries without adding another data plot.
     for i,status in enumerate(status_order):
@@ -897,13 +917,20 @@ def build_single_sensor_profile(profile, tag, title=None):
             marker=dict(size=14,symbol="square",color=step_colors[i%len(step_colors)]),hoverinfo="skip",
         ))
 
+    tick_source=d.drop_duplicates("Elapsed time (min)").sort_values("Elapsed time (min)")
+    if len(tick_source)>8:
+        positions=[round(i*(len(tick_source)-1)/7) for i in range(8)]
+        tick_source=tick_source.iloc[positions]
+    tickvals=tick_source["Elapsed time (min)"].tolist()
+    ticktext=[pd.to_datetime(x).strftime("%d-%m-%Y %H:%M") for x in tick_source["Date time"]]
+
     fig.update_layout(
         title=dict(text=title or f"{tag} Process Profile with Step Segmentation",x=0.5,xanchor="center",font=dict(size=23,color="#111111")),
         height=700,template="plotly_white",paper_bgcolor="white",plot_bgcolor="white",
         margin=dict(l=80,r=35,t=110,b=205),hovermode="x unified",dragmode="zoom",
         legend=dict(orientation="h",x=0.5,y=-0.27,xanchor="center",yanchor="top",title=dict(text="Process status"),font=dict(size=10)),
         xaxis=dict(
-            title="Date time",showgrid=True,gridcolor="#EEF0F2",tickformat="%d-%m %H:%M",
+            title="Elapsed time from sequence start (min)",showgrid=True,gridcolor="#EEF0F2",
             rangeselector=dict(
                 buttons=[
                     dict(count=10,label="10m",step="minute",stepmode="backward"),
@@ -914,6 +941,7 @@ def build_single_sensor_profile(profile, tag, title=None):
             ),
             showspikes=True,spikemode="across",spikesnap="cursor",spikethickness=1,
         ),
+        xaxis2=dict(title="Actual date and time",overlaying="x",side="top",tickmode="array",tickvals=tickvals,ticktext=ticktext,showgrid=False),
         yaxis=dict(title=y_title,showgrid=True,gridcolor="#E6E8EB",zeroline=False,fixedrange=False,
                    showspikes=True,spikemode="across",spikesnap="cursor"),
     )
@@ -975,7 +1003,7 @@ def safe_table(df,height=650,max_rows=3000,key=None):
     st.dataframe(view,width="stretch",hide_index=True,height=height,row_height=31,key=key)
 
 st.title("Universal ADAM and OMCA ANFDA Multi-Report Extractor")
-st.caption("Build: INTERACTIVE-MULTI-SENSOR-v9 | Multiple batch selection")
+st.caption("Build: INTERACTIVE-MULTI-SENSOR-v10 | Temperature statistics by step")
 st.caption("Fast extraction uses Poppler pdftotext, then applies the selected ADAM or OMCA parser. Multiple reports are supported without automatic detection delay.")
 uploads=st.sidebar.file_uploader(
     "Upload multiple report PDFs",
@@ -1258,6 +1286,101 @@ with tabs[2]:
                     show_plot_with_downloads(fig,f"single_batch_{tag}_v9",f"{selected_batches[0]}_{tag}",700)
         display_columns=["Source report","Batch","Date time","Elapsed time (min)","Step status"]+selected_tags
         safe_table(chronological[display_columns],height=650,max_rows=max(3000,len(chronological)),key="multi_batch_profile_table_v9")
+
+        st.divider()
+        st.subheader("Temperature Statistical Analysis by Batch and Process Step")
+        st.caption("For each selected temperature sensor and process step, the app calculates count, minimum, maximum, mean, sample standard deviation, range, and %RSD using the selected start-to-end process sequence.")
+
+        available_stat_batches=sorted(chronological["Batch"].dropna().astype(str).unique())
+        available_stat_temp_tags=sorted(
+            c for c in chronological.columns
+            if str(c).upper().startswith(("TICR","TT-"))
+        )
+        stat_col1,stat_col2=st.columns(2)
+        with stat_col1:
+            stat_batches=st.multiselect(
+                "Batches for temperature statistics",
+                available_stat_batches,
+                default=available_stat_batches,
+                key="temperature_stats_batches_v10",
+            )
+        with stat_col2:
+            default_stat_tags=[x for x in ts if x in available_stat_temp_tags]
+            stat_temp_tags=st.multiselect(
+                "Temperature sensor tags for statistics",
+                available_stat_temp_tags,
+                default=default_stat_tags or available_stat_temp_tags[:1],
+                key="temperature_stats_tags_v10",
+            )
+
+        available_stat_steps=sorted(
+            x for x in chronological["Step status"].dropna().astype(str).unique()
+            if x.strip()
+        )
+        stat_steps=st.multiselect(
+            "Process steps for statistics",
+            available_stat_steps,
+            default=available_stat_steps,
+            key="temperature_stats_steps_v10",
+        )
+
+        statistic_frames=[]
+        statistics_source=chronological[
+            chronological["Batch"].astype(str).isin(stat_batches)
+            & chronological["Step status"].astype(str).isin(stat_steps)
+        ].copy()
+        for temperature_tag in stat_temp_tags:
+            if temperature_tag not in statistics_source.columns:
+                continue
+            part=statistics_source[["Batch","Step status",temperature_tag]].copy()
+            part[temperature_tag]=pd.to_numeric(part[temperature_tag],errors="coerce")
+            part=part.dropna(subset=[temperature_tag])
+            if part.empty:
+                continue
+            tag_stats=(
+                part.groupby(["Batch","Step status"],dropna=False,observed=True)[temperature_tag]
+                .agg(
+                    Count="count",
+                    Minimum="min",
+                    Maximum="max",
+                    Mean="mean",
+                    Standard_deviation="std",
+                )
+                .reset_index()
+            )
+            tag_stats.insert(2,"Temperature sensor",temperature_tag)
+            tag_stats["Range"]=tag_stats["Maximum"]-tag_stats["Minimum"]
+            tag_stats["%RSD"]=tag_stats["Standard_deviation"].div(tag_stats["Mean"].abs()).mul(100)
+            statistic_frames.append(tag_stats)
+
+        if not statistic_frames:
+            st.info("No temperature data are available for the selected batches, sensor tags, and process steps.")
+        else:
+            temperature_statistics=pd.concat(statistic_frames,ignore_index=True)
+            numeric_columns=["Minimum","Maximum","Mean","Standard_deviation","Range","%RSD"]
+            temperature_statistics[numeric_columns]=temperature_statistics[numeric_columns].round(3)
+            temperature_statistics=temperature_statistics.sort_values(
+                ["Batch","Temperature sensor","Step status"],kind="stable"
+            )
+            stat_m1,stat_m2,stat_m3,stat_m4=st.columns(4)
+            stat_m1.metric("Batches",temperature_statistics["Batch"].nunique())
+            stat_m2.metric("Temperature sensors",temperature_statistics["Temperature sensor"].nunique())
+            stat_m3.metric("Process steps",temperature_statistics["Step status"].nunique())
+            stat_m4.metric("Statistical rows",len(temperature_statistics))
+            safe_table(
+                temperature_statistics,
+                height=650,
+                max_rows=max(3000,len(temperature_statistics)),
+                key="temperature_step_statistics_table_v10",
+            )
+            st.download_button(
+                "Download temperature statistics CSV",
+                data=temperature_statistics.to_csv(index=False).encode("utf-8-sig"),
+                file_name="temperature_statistics_by_batch_sensor_step.csv",
+                mime="text/csv",
+                width="stretch",
+                key="download_temperature_statistics_v10",
+            )
 
 with tabs[3]:
     st.subheader("Report tag extraction audit")
