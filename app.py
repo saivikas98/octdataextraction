@@ -786,7 +786,6 @@ def build_multi_sensor_profile(profile, tags, title=None):
         ),
         xaxis=dict(
             title="Date time",showgrid=True,gridcolor="#EEF0F2",tickformat="%d-%m %H:%M",
-            rangeslider=dict(visible=True,thickness=0.08),
             rangeselector=dict(
                 buttons=[
                     dict(count=10,label="10m",step="minute",stepmode="backward"),
@@ -856,7 +855,6 @@ def build_single_sensor_profile(profile, tag, title=None):
         legend=dict(orientation="h",x=0.5,y=-0.27,xanchor="center",yanchor="top",title=dict(text="Process status"),font=dict(size=10)),
         xaxis=dict(
             title="Date time",showgrid=True,gridcolor="#EEF0F2",tickformat="%d-%m %H:%M",
-            rangeslider=dict(visible=True,thickness=0.08),
             rangeselector=dict(
                 buttons=[
                     dict(count=10,label="10m",step="minute",stepmode="backward"),
@@ -898,7 +896,7 @@ def show_plot_with_downloads(fig, chart_key, file_stem, height=None):
         },
     }
     st.plotly_chart(fig, width="stretch", key=chart_key, config=plot_config)
-    st.caption("Interactive: hover for values, drag to zoom, mouse wheel to zoom, double-click to reset, use the range slider or 10m/30m/1h/All buttons. Camera icon downloads PNG.")
+    st.caption("Interactive: hover for values, drag to zoom, mouse wheel to zoom, double-click to reset, use the 10m/30m/1h/All buttons. Camera icon downloads PNG.")
     html_bytes=fig.to_html(full_html=True, include_plotlyjs=True, config=plot_config).encode("utf-8")
     st.download_button(
         "Download interactive HTML",
@@ -928,7 +926,7 @@ def safe_table(df,height=650,max_rows=3000,key=None):
     st.dataframe(view,width="stretch",hide_index=True,height=height,row_height=31,key=key)
 
 st.title("Universal ADAM and OMCA ANFDA Multi-Report Extractor")
-st.caption("Build: INTERACTIVE-MULTI-SENSOR-v8 | Multiple sensors in one plot")
+st.caption("Build: INTERACTIVE-MULTI-SENSOR-v8.1 | Range slider removed")
 st.caption("Fast extraction uses Poppler pdftotext, then applies the selected ADAM or OMCA parser. Multiple reports are supported without automatic detection delay.")
 uploads=st.sidebar.file_uploader(
     "Upload multiple report PDFs",
