@@ -25,7 +25,7 @@ def clear_application_cache():
 st.set_page_config(page_title="ADAM Process Report - Tagwise Extraction", page_icon="📊", layout="wide")
 
 st.sidebar.header("Application controls")
-if st.sidebar.button("Clear application cache", type="primary", use_container_width=True, help="Clears parsed-report data, Streamlit resources, and temporary report selections, then reloads the app."):
+if st.sidebar.button("Clear application cache", type="primary", width="stretch", help="Clears parsed-report data, Streamlit resources, and temporary report selections, then reloads the app."):
     clear_application_cache()
     st.rerun()
 if st.session_state.pop("cache_cleared_notice", False):
@@ -611,34 +611,63 @@ def make_step_elapsed_profile(wide_df, selected_steps):
         parts.append(g)
     return pd.concat(parts, ignore_index=True, sort=False) if parts else pd.DataFrame()
 
+def apply_clean_profile_style(fig, title, x_title, y_title):
+    """Compact single-panel profile chart with a right-side legend."""
+    fig.update_traces(mode="lines+markers", line=dict(width=2), marker=dict(size=6))
+    fig.update_layout(
+        title=dict(text=title, x=0.0, xanchor="left", font=dict(size=18, color="#2F2F2F")),
+        xaxis_title=x_title,
+        yaxis_title=y_title,
+        height=440,
+        template="plotly_white",
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        hovermode="x unified",
+        margin=dict(l=70, r=350, t=75, b=70),
+        legend=dict(
+            title=dict(text="Batch | Step | Run", font=dict(size=12, color="#667085")),
+            orientation="v", yanchor="top", y=1.0, xanchor="left", x=1.02,
+            font=dict(size=11), bgcolor="rgba(255,255,255,0)", borderwidth=0,
+        ),
+    )
+    fig.update_xaxes(showgrid=False, showline=True, linecolor="#D0D5DD", zeroline=False,
+                     tickfont=dict(color="#667085"), title_font=dict(color="#667085"))
+    fig.update_yaxes(showgrid=True, gridcolor="#E4E7EC", gridwidth=1, showline=False, zeroline=False,
+                     tickfont=dict(color="#667085"), title_font=dict(color="#667085"))
+    return fig
+
 def show_plot_with_downloads(fig, chart_key, file_stem, height=None):
-    """Display a Plotly chart and provide HTML and high-resolution PNG downloads."""
+    """Display a Plotly chart with browser-side PNG and HTML downloads.
+
+    PNG uses Plotly's camera button in the chart toolbar. This runs in the
+    user's browser and does not require Kaleido, Chrome, or server memory.
+    """
     if height:
         fig.update_layout(height=height)
-    st.plotly_chart(fig, use_container_width=True, key=chart_key)
     safe_name=re.sub(r"[^A-Za-z0-9_-]+", "_", str(file_stem)).strip("_") or "plot"
-    html_bytes=fig.to_html(full_html=True, include_plotlyjs=True).encode("utf-8")
-    left,right=st.columns(2)
-    left.download_button(
+    plot_config={
+        "displaylogo": False,
+        "responsive": True,
+        "toImageButtonOptions": {
+            "format": "png",
+            "filename": safe_name,
+            "height": 900,
+            "width": 1800,
+            "scale": 2,
+        },
+    }
+    st.plotly_chart(fig, width="stretch", key=chart_key, config=plot_config)
+    st.caption("PNG: click the camera icon in the plot toolbar. HTML: use the button below.")
+    html_bytes=fig.to_html(full_html=True, include_plotlyjs=True, config=plot_config).encode("utf-8")
+    st.download_button(
         "Download interactive HTML",
         data=html_bytes,
         file_name=f"{safe_name}.html",
         mime="text/html",
         key=f"download_html_{chart_key}",
-        use_container_width=True,
+        width="stretch",
     )
-    try:
-        png_bytes=fig.to_image(format="png", width=1800, height=1000, scale=2)
-        right.download_button(
-            "Download high-resolution PNG",
-            data=png_bytes,
-            file_name=f"{safe_name}.png",
-            mime="image/png",
-            key=f"download_png_{chart_key}",
-            use_container_width=True,
-        )
-    except Exception as exc:
-        right.info("PNG export unavailable. Ensure kaleido is installed; HTML download remains available.")
+
 
 def safe_table(df,height=650,max_rows=3000,key=None):
     df=df.copy()
@@ -655,7 +684,7 @@ def safe_table(df,height=650,max_rows=3000,key=None):
     for c in view.columns:
         if pd.api.types.is_datetime64_any_dtype(view[c]): view[c]=view[c].dt.strftime("%d/%m/%Y %H:%M:%S").fillna("")
         elif str(view[c].dtype) in ("object","category"): view[c]=view[c].astype(str).replace("nan","")
-    st.dataframe(view,use_container_width=True,hide_index=True,height=height,row_height=31,key=key)
+    st.dataframe(view,width="stretch",hide_index=True,height=height,row_height=31,key=key)
 
 st.title("Universal ADAM and OMCA ANFDA Multi-Report Extractor")
 st.caption("Fast extraction uses Poppler pdftotext, then applies the selected ADAM or OMCA parser. Multiple reports are supported without automatic detection delay.")
@@ -679,7 +708,7 @@ if large:
     st.stop()
 
 st.sidebar.subheader("Processing control")
-process_now=st.sidebar.button("Process uploaded reports",type="primary",use_container_width=True)
+process_now=st.sidebar.button("Process uploaded reports",type="primary",width="stretch")
 if not process_now and "processed_reports" not in st.session_state:
     st.info("Select each report type, then click **Process uploaded reports**. Processing will run once and results will remain in the session.")
 
@@ -897,39 +926,39 @@ with tabs[2]:
         with c_temp:
             select_all_temperature = st.checkbox(
                 "Select all temperature tags",
-                value=True,
+                value=False,
                 key="select_all_temperature_tags",
             )
             selected_temperature_tags = st.multiselect(
                 "Temperature tags",
                 temperature_tags,
-                default=temperature_tags if select_all_temperature else [],
+                default=(temperature_tags[:1] if temperature_tags and not select_all_temperature else temperature_tags),
                 key="profile_temperature_tags",
                 help="Includes all available TICR and TT tags in the selected batches.",
             )
         with c_pressure:
             select_all_pressure = st.checkbox(
                 "Select all pressure tags",
-                value=True,
+                value=False,
                 key="select_all_pressure_tags",
             )
             selected_pressure_tags = st.multiselect(
                 "Pressure tags",
                 pressure_tags,
-                default=pressure_tags if select_all_pressure else [],
+                default=(pressure_tags[:1] if pressure_tags and not select_all_pressure else pressure_tags),
                 key="profile_pressure_tags",
                 help="Includes all available PICR and PT tags in the selected batches.",
             )
         with c_load:
             select_all_loadcell = st.checkbox(
                 "Select all load-cell tags",
-                value=True,
+                value=False,
                 key="select_all_loadcell_tags",
             )
             selected_loadcell_tags = st.multiselect(
                 "Load-cell tags",
                 loadcell_tags,
-                default=loadcell_tags if select_all_loadcell else [],
+                default=(loadcell_tags[:1] if loadcell_tags and not select_all_loadcell else loadcell_tags),
                 key="profile_loadcell_tags",
                 help="Includes all available LSICR tags in the selected batches.",
             )
@@ -954,7 +983,11 @@ with tabs[2]:
                 st.caption(f"Profile rows: {len(profile):,}")
                 x_col = "Elapsed time (min)" if x_mode.startswith("Elapsed") else "Date time"
                 plot_profile = profile.iloc[::max(1, len(profile)//12000)].copy()
-                for tag in selected_tags:
+                max_profile_charts=12
+                if len(selected_tags)>max_profile_charts:
+                    st.warning(f"{len(selected_tags)} tags are selected. Only the first {max_profile_charts} plots are rendered to prevent connection loss. Narrow the selection to plot the remaining tags.")
+                rendered_tags=selected_tags[:max_profile_charts]
+                for tag in rendered_tags:
                     chart = plot_profile[[x_col, "Profile label", "Batch", "Step status", tag]].dropna(subset=[tag])
                     if chart.empty:
                         continue
@@ -971,18 +1004,31 @@ with tabs[2]:
                     else:
                         chart_title = tag
                         y_label = "Value"
-                    fig = px.line(chart, x=x_col, y=tag, color="Profile label", line_group="Profile label",
-                                  markers=True, title=chart_title, hover_data=["Batch", "Step status"],
-                                  labels={tag: y_label})
-                    fig.update_layout(height=430, legend_title_text="Batch | Step | Run")
+                    fig = px.line(
+                        chart,
+                        x=x_col,
+                        y=tag,
+                        color="Profile label",
+                        line_group="Profile label",
+                        markers=True,
+                        hover_data=["Batch", "Step status"],
+                        labels={tag: y_label},
+                        color_discrete_sequence=px.colors.qualitative.Plotly,
+                    )
+                    fig = apply_clean_profile_style(
+                        fig,
+                        title=chart_title,
+                        x_title=x_col,
+                        y_title=y_label,
+                    )
                     show_plot_with_downloads(
                         fig,
                         chart_key=f"profile_{tag}_{x_mode}",
                         file_stem=f"cross_batch_{'_'.join(selected_batches)}_{tag}_{x_mode}",
-                        height=430,
+                        height=440,
                     )
                 # Sort while Step occurrence still exists, then select visible columns.
-                columns = ["Source report", "Batch", "Date time", "Elapsed time (min)", "Step status"] + selected_tags
+                columns = ["Source report", "Batch", "Date time", "Elapsed time (min)", "Step status"] + rendered_tags
                 sorted_profile = profile.sort_values(["Source report", "Step occurrence", "Date time"], kind="stable")
                 safe_table(sorted_profile[columns],
                            height=650, max_rows=max(3000, len(sorted_profile)), key="cross_batch_profile_table")
