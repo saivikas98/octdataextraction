@@ -1094,3 +1094,4 @@ with tabs[9]:
     safe_table(pd.DataFrame(meta.items(),columns=["Field","Value"]),height=430)
 
 st.caption("All PDFs are processed independently in memory. The app does not create or store Excel/CSV files.")
+
