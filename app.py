@@ -886,35 +886,94 @@ with tabs[2]:
         ]
         default_steps = [x for x in requested_defaults if x in profile_steps]
         selected_steps = st.multiselect("Step names", profile_steps, default=default_steps, key="profile_steps")
-        profile_tags = [x for x in ["LSICR004", "LSICR005", "PICR006", "TICR008", "TA005"] if x in cross_wide.columns]
-        selected_tags = st.multiselect("Profile tags", profile_tags, default=profile_tags, key="profile_tags")
+        # Automatically classify every available process tag by instrument family.
+        all_profile_columns = [str(c) for c in cross_wide.columns]
+        temperature_tags = sorted(c for c in all_profile_columns if c.upper().startswith(("TICR", "TT-")))
+        pressure_tags = sorted(c for c in all_profile_columns if c.upper().startswith(("PICR", "PT-")))
+        loadcell_tags = sorted(c for c in all_profile_columns if c.upper().startswith("LSICR"))
+
+        st.markdown("#### Instrument-tag selection")
+        c_temp, c_pressure, c_load = st.columns(3)
+        with c_temp:
+            select_all_temperature = st.checkbox(
+                "Select all temperature tags",
+                value=True,
+                key="select_all_temperature_tags",
+            )
+            selected_temperature_tags = st.multiselect(
+                "Temperature tags",
+                temperature_tags,
+                default=temperature_tags if select_all_temperature else [],
+                key="profile_temperature_tags",
+                help="Includes all available TICR and TT tags in the selected batches.",
+            )
+        with c_pressure:
+            select_all_pressure = st.checkbox(
+                "Select all pressure tags",
+                value=True,
+                key="select_all_pressure_tags",
+            )
+            selected_pressure_tags = st.multiselect(
+                "Pressure tags",
+                pressure_tags,
+                default=pressure_tags if select_all_pressure else [],
+                key="profile_pressure_tags",
+                help="Includes all available PICR and PT tags in the selected batches.",
+            )
+        with c_load:
+            select_all_loadcell = st.checkbox(
+                "Select all load-cell tags",
+                value=True,
+                key="select_all_loadcell_tags",
+            )
+            selected_loadcell_tags = st.multiselect(
+                "Load-cell tags",
+                loadcell_tags,
+                default=loadcell_tags if select_all_loadcell else [],
+                key="profile_loadcell_tags",
+                help="Includes all available LSICR tags in the selected batches.",
+            )
+
+        selected_tags = list(dict.fromkeys(
+            selected_temperature_tags + selected_pressure_tags + selected_loadcell_tags
+        ))
         x_mode = st.radio("X-axis", ["Elapsed time from step start", "Actual date/time"], horizontal=True, key="profile_x_mode")
         if not selected_steps or not selected_tags:
-            st.info("Select at least one step and one tag.")
+            st.info("Select at least one step and one temperature, pressure, or load-cell tag.")
         else:
             profile = make_step_elapsed_profile(cross_wide, selected_steps)
             if profile.empty:
                 st.info("No records match the selected batches and steps.")
             else:
-                m1,m2,m3=st.columns(3)
+                m1,m2,m3,m4,m5=st.columns(5)
                 m1.metric("Selected batches",len(selected_batches))
                 m2.metric("Selected steps",len(selected_steps))
-                m3.metric("Profile rows",f"{len(profile):,}")
+                m3.metric("Temperature tags",len(selected_temperature_tags))
+                m4.metric("Pressure tags",len(selected_pressure_tags))
+                m5.metric("Load-cell tags",len(selected_loadcell_tags))
+                st.caption(f"Profile rows: {len(profile):,}")
                 x_col = "Elapsed time (min)" if x_mode.startswith("Elapsed") else "Date time"
                 plot_profile = profile.iloc[::max(1, len(profile)//12000)].copy()
-                titles = {
-                    "LSICR004": "MV04 vessel weight (kg)",
-                    "LSICR005": "MV05 vessel weight (kg)",
-                    "PICR006": "MV05 pressure (bar)",
-                    "TICR008": "MV05 temperature (°C)",
-                    "TA005": "MV05 agitator speed (RPM)",
-                }
                 for tag in selected_tags:
                     chart = plot_profile[[x_col, "Profile label", "Batch", "Step status", tag]].dropna(subset=[tag])
                     if chart.empty:
                         continue
+                    tag_upper = tag.upper()
+                    if tag_upper.startswith("LSICR"):
+                        chart_title = f"{tag} load-cell profile (kg)"
+                        y_label = "Weight (kg)"
+                    elif tag_upper.startswith(("PICR", "PT-")):
+                        chart_title = f"{tag} pressure profile"
+                        y_label = "Pressure"
+                    elif tag_upper.startswith(("TICR", "TT-")):
+                        chart_title = f"{tag} temperature profile (°C)"
+                        y_label = "Temperature (°C)"
+                    else:
+                        chart_title = tag
+                        y_label = "Value"
                     fig = px.line(chart, x=x_col, y=tag, color="Profile label", line_group="Profile label",
-                                  markers=True, title=titles.get(tag, tag), hover_data=["Batch", "Step status"])
+                                  markers=True, title=chart_title, hover_data=["Batch", "Step status"],
+                                  labels={tag: y_label})
                     fig.update_layout(height=430, legend_title_text="Batch | Step | Run")
                     show_plot_with_downloads(
                         fig,
