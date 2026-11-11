@@ -866,9 +866,11 @@ with tabs[2]:
                                   markers=True, title=titles.get(tag, tag), hover_data=["Batch", "Step status"])
                     fig.update_layout(height=430, legend_title_text="Batch | Step | Run")
                     st.plotly_chart(fig, use_container_width=True, key=f"profile_{tag}_{x_mode}")
+                # Sort while Step occurrence still exists, then select visible columns.
                 columns = ["Source report", "Batch", "Date time", "Elapsed time (min)", "Step status"] + selected_tags
-                safe_table(profile[columns].sort_values(["Source report", "Step occurrence", "Date time"]),
-                           height=650, max_rows=max(3000, len(profile)), key="cross_batch_profile_table")
+                sorted_profile = profile.sort_values(["Source report", "Step occurrence", "Date time"], kind="stable")
+                safe_table(sorted_profile[columns],
+                           height=650, max_rows=max(3000, len(sorted_profile)), key="cross_batch_profile_table")
 
 with tabs[3]:
     st.subheader("Report tag extraction audit")
