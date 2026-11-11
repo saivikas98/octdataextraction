@@ -613,6 +613,63 @@ def make_step_elapsed_profile(wide_df, selected_steps):
         parts.append(g)
     return pd.concat(parts, ignore_index=True, sort=False) if parts else pd.DataFrame()
 
+def identify_process_sequences(data, start_step, end_step, max_duration_minutes=180):
+    """Pair each start-step occurrence with the next end-step occurrence.
+
+    The returned rows include every process status between the two boundaries,
+    which creates the requested continuous profile rather than sparse selected-step lines.
+    """
+    d=data.sort_values("Date time").copy()
+    if d.empty:
+        return []
+    status=d["Step status"].astype(str)
+    new_run=status.ne(status.shift()) | d["Date time"].diff().dt.total_seconds().div(60).gt(5)
+    d["_run"]=new_run.cumsum()
+    runs=(d.groupby("_run",as_index=False)
+          .agg(Status=("Step status","first"),Start=("Date time","min"),End=("Date time","max"),Rows=("Date time","size")))
+    starts=runs[runs["Status"].astype(str)==str(start_step)]
+    ends=runs[runs["Status"].astype(str)==str(end_step)]
+    sequences=[]
+    for _,sr in starts.iterrows():
+        possible=ends[(ends["Start"]>=sr["Start"]) &
+                      ((ends["End"]-sr["Start"]).dt.total_seconds()/60<=float(max_duration_minutes))]
+        if possible.empty:
+            continue
+        er=possible.iloc[0]
+        seq=d[(d["Date time"]>=sr["Start"]) & (d["Date time"]<=er["End"])].copy()
+        if seq.empty:
+            continue
+        mv04_gain=0.0
+        if "LSICR004" in seq.columns and seq["LSICR004"].notna().any():
+            mv04_gain=float(seq["LSICR004"].iloc[-1]-seq["LSICR004"].iloc[0])
+        duration=(er["End"]-sr["Start"]).total_seconds()/60
+        label=(f"{sr['Start']:%d-%m-%Y %H:%M} to {er['End']:%H:%M} | "
+               f"{duration:.0f} min | {len(seq):,} rows | MV04 net {mv04_gain:.2f} kg")
+        sequences.append({"label":label,"start":sr["Start"],"end":er["End"],
+                          "duration":duration,"gain":mv04_gain,"data":seq})
+    return sequences
+
+def identify_profile_windows(data, selected_steps, gap_minutes=10):
+    """Split matching process records into contiguous chronological windows."""
+    d=data[data["Step status"].astype(str).isin(selected_steps)].sort_values("Date time").copy()
+    if d.empty:
+        return d, []
+    gap=d["Date time"].diff().dt.total_seconds().div(60)
+    d["Profile window"]=(gap.isna()|gap.gt(float(gap_minutes))).cumsum()
+    options=[]
+    for window_id,g in d.groupby("Profile window",sort=True):
+        start=g["Date time"].min(); end=g["Date time"].max()
+        steps=[]
+        for value in g["Step status"].astype(str):
+            if value not in steps: steps.append(value)
+        gain=0.0
+        if "LSICR004" in g.columns and g["LSICR004"].notna().any():
+            gain=float(g["LSICR004"].max()-g["LSICR004"].min())
+        label=(f"Window {int(window_id)} | {start:%d-%m-%Y %H:%M} to {end:%H:%M} | "
+               f"{len(g):,} rows | MV04 range {gain:.2f} kg")
+        options.append({"id":window_id,"label":label,"start":start,"end":end,"gain":gain,"steps":steps})
+    return d,options
+
 def build_segmented_multipanel(profile, tags, x_col="Date time", title="MV04/MV05 Process Profile with Step Segmentation"):
     """Build the requested chronological multi-panel profile.
 
@@ -752,7 +809,7 @@ def safe_table(df,height=650,max_rows=3000,key=None):
     st.dataframe(view,width="stretch",hide_index=True,height=height,row_height=31,key=key)
 
 st.title("Universal ADAM and OMCA ANFDA Multi-Report Extractor")
-st.caption("Build: EXACT-SEGMENTED-v2 | Chronological multi-panel profile")
+st.caption("Build: EXACT-SEGMENTED-v4 | Start-to-end process sequence")
 st.caption("Fast extraction uses Poppler pdftotext, then applies the selected ADAM or OMCA parser. Multiple reports are supported without automatic detection delay.")
 uploads=st.sidebar.file_uploader(
     "Upload multiple report PDFs",
@@ -792,7 +849,7 @@ for idx,uploaded in enumerate(uploads):
     )
 
 @st.cache_data(show_spinner=False, max_entries=2, ttl=1800)
-def process_uploaded_report(file_name, raw, selected_type, parser_version="exact-segmented-v2"):
+def process_uploaded_report(file_name, raw, selected_type, parser_version="exact-segmented-v4-sequence"):
     pages,extraction_engine,text_extraction_seconds=extract_pdf_pages(raw)
     tag_inventory=scan_report_tag_headers(pages)
     detected_type=selected_type
@@ -840,7 +897,7 @@ if process_now:
         selected_type=report_type_by_file[uploaded.name]
         progress.progress(i/len(uploads),text=f"Extracting {uploaded.name} as {selected_type} ({i+1} of {len(uploads)})")
         try:
-            reports.append(process_uploaded_report(uploaded.name,uploaded.getvalue(),selected_type,"exact-segmented-v2"))
+            reports.append(process_uploaded_report(uploaded.name,uploaded.getvalue(),selected_type,"exact-segmented-v4-sequence"))
         except Exception as exc:
             reports.append({"file_name":uploaded.name,"detected_type":"Failed","error":str(exc),"long_df":pd.DataFrame(),"events":pd.DataFrame(),"alarms":pd.DataFrame(),"groups":{},"meta":{"File name":uploaded.name},"adam_score":0,"omca_score":0})
         gc.collect()
@@ -953,69 +1010,60 @@ with tabs[1]:
     safe_table(summary,height=600)
 with tabs[2]:
     st.subheader("MV04/MV05 Process Profile with Step Segmentation")
-    st.caption("This plot is chronological. Independent steps are not aligned at elapsed time zero, preventing overlapping lines and duplicate x=0 points.")
+    st.caption("Choose the sequence start and end steps. The plot includes every intermediate process row and prevents unrelated operation periods from being connected.")
     cross_wide=build_cross_batch_wide(valid)
     if cross_wide.empty:
         st.info("Process at least one ADAM Process report to create the segmented profile.")
     else:
         available_batches=sorted(x for x in cross_wide["Batch"].dropna().astype(str).unique() if x.strip())
-        selected_batch=st.selectbox(
-            "Batch number",
-            available_batches,
-            key="exact_segmented_batch_v2",
-        )
+        selected_batch=st.selectbox("Batch number",available_batches,key="exact_segmented_batch_v4")
         one_batch=cross_wide[cross_wide["Batch"].astype(str)==str(selected_batch)].sort_values("Date time").copy()
+        all_steps=[]
+        for value in one_batch["Step status"].dropna().astype(str):
+            if value.strip() and value not in all_steps: all_steps.append(value)
 
-        all_steps=sorted(x for x in one_batch["Step status"].dropna().astype(str).unique() if x.strip())
-        desired_steps=[
-            "MANUAL PROMPT",
-            "TRANSFER FROM MV01 TO MV04",
-            "MV03 DEPRESSURISE",
-            "TRANSFER API FROM MV03 TO MV04",
-            "MV04 AGITATION",
-            "CHECKS BEFORE COACERVATION",
-            "TRANSFER FROM SFV01 TO MV04",
-        ]
-        default_steps=[x for x in desired_steps if x in all_steps]
-        selected_steps=st.multiselect(
-            "Process steps",
-            all_steps,
-            default=default_steps,
-            key="exact_segmented_steps_v2",
-        )
+        preferred_start="TRANSFER FROM MV01 TO MV04"
+        preferred_end="TRANSFER FROM SFV01 TO MV04"
+        start_index=all_steps.index(preferred_start) if preferred_start in all_steps else 0
+        end_index=all_steps.index(preferred_end) if preferred_end in all_steps else max(0,len(all_steps)-1)
+        c_start,c_end,c_duration=st.columns([2,2,1])
+        with c_start:
+            start_step=st.selectbox("Sequence start step",all_steps,index=start_index,key="sequence_start_v4")
+        with c_end:
+            end_step=st.selectbox("Sequence end step",all_steps,index=end_index,key="sequence_end_v4")
+        with c_duration:
+            max_duration=st.number_input("Max duration (min)",min_value=10,max_value=1440,value=180,step=10,key="sequence_duration_v4")
 
         fixed_tags=[x for x in ["LSICR004","LSICR005","PICR006","TICR008","TA005"] if x in one_batch.columns]
         st.write("**Fixed profile tags:** "+", ".join(fixed_tags))
-        if not selected_steps:
-            st.info("Select at least one process step.")
-        elif not fixed_tags:
-            st.warning("The selected report does not contain LSICR004, LSICR005, PICR006, TICR008, or TA005.")
+        sequences=identify_process_sequences(one_batch,start_step,end_step,max_duration)
+        if not fixed_tags:
+            st.warning("The selected report does not contain the required profile tags.")
+        elif not sequences:
+            st.warning("No start-to-end sequence was found. Increase Max duration or select another start/end step pair.")
         else:
-            chronological=one_batch[one_batch["Step status"].astype(str).isin(selected_steps)].copy()
-            chronological=chronological.sort_values("Date time")
-            if chronological.empty:
-                st.info("No records match the selected steps.")
-            else:
-                # One continuous chronological figure, exactly matching the requested structure.
-                combined_fig=build_segmented_multipanel(
-                    chronological,
-                    tags=fixed_tags,
-                    x_col="Date time",
-                    title="MV04/MV05 Process Profile with Step Segmentation",
-                )
-                show_plot_with_downloads(
-                    combined_fig,
-                    chart_key=f"exact_segmented_v2_{selected_batch}",
-                    file_stem=f"MV04_MV05_segmented_{selected_batch}",
-                    height=max(900,245*(1+len([t for t in fixed_tags if t not in ["LSICR004","LSICR005"]]))+260),
-                )
-                display_columns=["Source report","Batch","Date time","Step status"]+fixed_tags
-                safe_table(
-                    chronological[display_columns],
-                    height=650,
-                    max_rows=max(3000,len(chronological)),
-                    key=f"exact_segmented_table_v2_{selected_batch}",
-                )
+            # Prefer the sequence with the greatest positive MV04 gain, then the shortest duration.
+            default_sequence=max(range(len(sequences)),key=lambda i:(sequences[i]["gain"],-sequences[i]["duration"]))
+            selected_label=st.selectbox("Matching process sequence",[x["label"] for x in sequences],index=default_sequence,key="matching_sequence_v4")
+            selected=next(x for x in sequences if x["label"]==selected_label)
+            chronological=selected["data"].copy().sort_values("Date time")
+            m1,m2,m3,m4=st.columns(4)
+            m1.metric("Sequence start",selected["start"].strftime("%d-%m-%Y %H:%M"))
+            m2.metric("Sequence end",selected["end"].strftime("%d-%m-%Y %H:%M"))
+            m3.metric("Duration (min)",f"{selected['duration']:.0f}")
+            m4.metric("Rows",f"{len(chronological):,}")
+            combined_fig=build_segmented_multipanel(
+                chronological,tags=fixed_tags,x_col="Date time",
+                title="MV04/MV05 Process Profile with Step Segmentation",
+            )
+            show_plot_with_downloads(
+                combined_fig,
+                chart_key=f"exact_segmented_v4_{selected_batch}_{selected['start']:%Y%m%d%H%M}",
+                file_stem=f"MV04_MV05_segmented_{selected_batch}_{selected['start']:%Y%m%d_%H%M}",
+                height=max(900,245*(1+len([t for t in fixed_tags if t not in ["LSICR004","LSICR005"]]))+260),
+            )
+            display_columns=["Source report","Batch","Date time","Step status"]+fixed_tags
+            safe_table(chronological[display_columns],height=650,max_rows=max(3000,len(chronological)),key=f"sequence_table_v4_{selected_batch}_{selected['start']:%Y%m%d%H%M}")
 
 with tabs[3]:
     st.subheader("Report tag extraction audit")
