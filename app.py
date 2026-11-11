@@ -8,6 +8,8 @@ import gc
 import re
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 import pdfplumber
 from pathlib import Path
@@ -611,29 +613,103 @@ def make_step_elapsed_profile(wide_df, selected_steps):
         parts.append(g)
     return pd.concat(parts, ignore_index=True, sort=False) if parts else pd.DataFrame()
 
-def apply_clean_profile_style(fig, title, x_title, y_title):
-    """Compact single-panel profile chart with a right-side legend."""
-    fig.update_traces(mode="lines+markers", line=dict(width=2), marker=dict(size=6))
+def build_segmented_multipanel(profile, tags, x_col, title="MV04/MV05 Process Profile with Step Segmentation"):
+    """Create one vertically stacked, shared-X process profile with step shading."""
+    if profile.empty or not tags:
+        return go.Figure()
+
+    tag_labels={
+        "LSICR004":"LSICR004 (MV04 weight)",
+        "LSICR005":"LSICR005 (MV05 weight)",
+        "PICR006":"PICR006 (bar)",
+        "TICR008":"TICR008 (°C)",
+        "TA005":"TA005 (RPM)",
+    }
+    y_titles={
+        "LSICR004":"Weight (kg)", "LSICR005":"Weight (kg)",
+        "PICR006":"PICR006 (bar)", "TICR008":"TICR008 (°C)",
+        "TA005":"TA005 (RPM)",
+    }
+    colors={
+        "LSICR004":"#5B7BE9", "LSICR005":"#E000A8", "PICR006":"#9467BD",
+        "TICR008":"#D62728", "TA005":"#2CA02C",
+    }
+    step_colors=["#DDF3EF","#EEEAF6","#DCECF7","#E9F6CF","#F1F1F1","#E9F7EA","#FFF4BF","#FDE8E8"]
+
+    rows=len(tags)
+    heights=[2.0]+[1.0]*(rows-1) if rows>1 else [1.0]
+    fig=make_subplots(rows=rows,cols=1,shared_xaxes=True,vertical_spacing=0.035,row_heights=heights)
+
+    # Colour each contiguous process-step segment across every panel.
+    shading=profile[[x_col,"Step status"]].drop_duplicates().sort_values(x_col).copy()
+    if not shading.empty:
+        gap=shading[x_col].diff() if pd.api.types.is_datetime64_any_dtype(shading[x_col]) else shading[x_col].diff()
+        if pd.api.types.is_datetime64_any_dtype(shading[x_col]):
+            split=shading["Step status"].ne(shading["Step status"].shift()) | gap.dt.total_seconds().div(60).gt(5)
+        else:
+            split=shading["Step status"].ne(shading["Step status"].shift()) | gap.gt(5)
+        shading["_segment"]=split.cumsum()
+        step_order=[]
+        for _,seg in shading.groupby("_segment",sort=True):
+            status=str(seg["Step status"].iloc[0])
+            if status not in step_order: step_order.append(status)
+            x0=seg[x_col].min()
+            x1=seg[x_col].max()
+            if pd.api.types.is_datetime64_any_dtype(shading[x_col]): x1=x1+pd.Timedelta(minutes=1)
+            else: x1=x1+1
+            fill=step_colors[step_order.index(status)%len(step_colors)]
+            fig.add_vrect(x0=x0,x1=x1,fillcolor=fill,opacity=0.55,line_width=0,layer="below")
+
+    labels=profile["Profile label"].dropna().astype(str).unique().tolist()
+    palette=px.colors.qualitative.Plotly+px.colors.qualitative.Safe+px.colors.qualitative.Set2
+    label_color={label:palette[i%len(palette)] for i,label in enumerate(labels)}
+
+    for row,tag in enumerate(tags,1):
+        if tag not in profile.columns: continue
+        for label,g in profile.groupby("Profile label",sort=False):
+            g=g.sort_values(x_col).dropna(subset=[tag])
+            if g.empty: continue
+            # Preserve fixed engineering colours for a single profile; use profile colours for comparisons.
+            line_color=colors.get(tag,"#1F77B4") if len(labels)==1 else label_color[str(label)]
+            fig.add_trace(go.Scatter(
+                x=g[x_col],y=g[tag],mode="lines+markers",name=str(label),legendgroup=str(label),
+                showlegend=(row==1),line=dict(color=line_color,width=2.3),marker=dict(size=5),
+                customdata=g[["Batch","Step status"]].astype(str).to_numpy(),
+                hovertemplate="Batch=%{customdata[0]}<br>Step=%{customdata[1]}<br>"+x_col+"=%{x}<br>Value=%{y:.3f}<extra></extra>",
+            ),row=row,col=1)
+        fig.update_yaxes(title_text=y_titles.get(tag,tag),row=row,col=1,showgrid=True,gridcolor="#E6E8EB",zeroline=False)
+
+    # Dynamic annotations for the two requested MV04 receipt steps when present.
+    if "LSICR004" in tags:
+        for step,caption in [("TRANSFER FROM MV01 TO MV04","MV01→MV04"),("TRANSFER FROM SFV01 TO MV04","SFV01→MV04")]:
+            a=profile[profile["Step status"].astype(str)==step].sort_values(x_col).dropna(subset=["LSICR004"])
+            if len(a)>=2:
+                first,last=a.iloc[0],a.iloc[-1]
+                fig.add_annotation(x=last[x_col],y=last["LSICR004"],xref="x",yref="y",
+                    text=f"{caption}: LSICR004 {first['LSICR004']:.2f}→{last['LSICR004']:.2f} kg",
+                    showarrow=True,arrowhead=2,ax=-115,ay=-45,font=dict(size=11,color="#111827"))
+
     fig.update_layout(
-        title=dict(text=title, x=0.0, xanchor="left", font=dict(size=18, color="#2F2F2F")),
-        xaxis_title=x_title,
-        yaxis_title=y_title,
-        height=440,
-        template="plotly_white",
-        paper_bgcolor="white",
-        plot_bgcolor="white",
-        hovermode="x unified",
-        margin=dict(l=70, r=350, t=75, b=70),
-        legend=dict(
-            title=dict(text="Batch | Step | Run", font=dict(size=12, color="#667085")),
-            orientation="v", yanchor="top", y=1.0, xanchor="left", x=1.02,
-            font=dict(size=11), bgcolor="rgba(255,255,255,0)", borderwidth=0,
-        ),
+        title=dict(text=title,x=0.5,xanchor="center",font=dict(size=24,color="#111111")),
+        height=max(650,260*rows),template="plotly_white",paper_bgcolor="white",plot_bgcolor="white",
+        margin=dict(l=80,r=40,t=95,b=125),hovermode="x unified",
+        legend=dict(orientation="h",x=0.0,y=1.015,xanchor="left",yanchor="bottom",title_text=""),
     )
-    fig.update_xaxes(showgrid=False, showline=True, linecolor="#D0D5DD", zeroline=False,
-                     tickfont=dict(color="#667085"), title_font=dict(color="#667085"))
-    fig.update_yaxes(showgrid=True, gridcolor="#E4E7EC", gridwidth=1, showline=False, zeroline=False,
-                     tickfont=dict(color="#667085"), title_font=dict(color="#667085"))
+    fig.update_xaxes(title_text=x_col,row=rows,col=1,showgrid=True,gridcolor="#EEF0F2")
+
+    # Process-status legend as coloured labels below the chart.
+    if not shading.empty:
+        status_names=[]
+        for status in shading["Step status"].astype(str):
+            if status not in status_names: status_names.append(status)
+        for i,status in enumerate(status_names):
+            fig.add_trace(go.Scatter(x=[None],y=[None],mode="markers",name=status,
+                marker=dict(size=14,symbol="square",color=step_colors[i%len(step_colors)]),
+                legendgroup=f"step_{status}",showlegend=True,hoverinfo="skip"),row=rows,col=1)
+        fig.update_layout(legend=dict(
+            orientation="h",x=0.5,y=-0.10,xanchor="center",yanchor="top",
+            title=dict(text="Process status"),font=dict(size=10),tracegroupgap=4,
+        ))
     return fig
 
 def show_plot_with_downloads(fig, chart_key, file_stem, height=None):
@@ -651,7 +727,7 @@ def show_plot_with_downloads(fig, chart_key, file_stem, height=None):
         "toImageButtonOptions": {
             "format": "png",
             "filename": safe_name,
-            "height": 900,
+            "height": 1000,
             "width": 1800,
             "scale": 2,
         },
@@ -983,50 +1059,26 @@ with tabs[2]:
                 st.caption(f"Profile rows: {len(profile):,}")
                 x_col = "Elapsed time (min)" if x_mode.startswith("Elapsed") else "Date time"
                 plot_profile = profile.iloc[::max(1, len(profile)//12000)].copy()
-                max_profile_charts=12
-                if len(selected_tags)>max_profile_charts:
-                    st.warning(f"{len(selected_tags)} tags are selected. Only the first {max_profile_charts} plots are rendered to prevent connection loss. Narrow the selection to plot the remaining tags.")
-                rendered_tags=selected_tags[:max_profile_charts]
-                for tag in rendered_tags:
-                    chart = plot_profile[[x_col, "Profile label", "Batch", "Step status", tag]].dropna(subset=[tag])
-                    if chart.empty:
-                        continue
-                    tag_upper = tag.upper()
-                    if tag_upper.startswith("LSICR"):
-                        chart_title = f"{tag} load-cell profile (kg)"
-                        y_label = "Weight (kg)"
-                    elif tag_upper.startswith(("PICR", "PT-")):
-                        chart_title = f"{tag} pressure profile"
-                        y_label = "Pressure"
-                    elif tag_upper.startswith(("TICR", "TT-")):
-                        chart_title = f"{tag} temperature profile (°C)"
-                        y_label = "Temperature (°C)"
-                    else:
-                        chart_title = tag
-                        y_label = "Value"
-                    fig = px.line(
-                        chart,
-                        x=x_col,
-                        y=tag,
-                        color="Profile label",
-                        line_group="Profile label",
-                        markers=True,
-                        hover_data=["Batch", "Step status"],
-                        labels={tag: y_label},
-                        color_discrete_sequence=px.colors.qualitative.Plotly,
-                    )
-                    fig = apply_clean_profile_style(
-                        fig,
-                        title=chart_title,
-                        x_title=x_col,
-                        y_title=y_label,
-                    )
-                    show_plot_with_downloads(
-                        fig,
-                        chart_key=f"profile_{tag}_{x_mode}",
-                        file_stem=f"cross_batch_{'_'.join(selected_batches)}_{tag}_{x_mode}",
-                        height=440,
-                    )
+                # Render one combined, vertically stacked profile exactly like the requested segmented figure.
+                preferred_order=["LSICR004","LSICR005","PICR006","TICR008","TA005"]
+                rendered_tags=[t for t in preferred_order if t in selected_tags]
+                rendered_tags += [t for t in selected_tags if t not in rendered_tags]
+                max_panels=8
+                if len(rendered_tags)>max_panels:
+                    st.warning(f"{len(rendered_tags)} tags selected. The first {max_panels} are shown in the combined profile for readability.")
+                    rendered_tags=rendered_tags[:max_panels]
+                combined_fig=build_segmented_multipanel(
+                    plot_profile,
+                    tags=rendered_tags,
+                    x_col=x_col,
+                    title="MV04/MV05 Process Profile with Step Segmentation",
+                )
+                show_plot_with_downloads(
+                    combined_fig,
+                    chart_key=f"segmented_profile_{x_mode}_{'_'.join(rendered_tags)}",
+                    file_stem=f"segmented_profile_{'_'.join(selected_batches)}_{x_mode}",
+                    height=max(650,260*len(rendered_tags)),
+                )
                 # Sort while Step occurrence still exists, then select visible columns.
                 columns = ["Source report", "Batch", "Date time", "Elapsed time (min)", "Step status"] + rendered_tags
                 sorted_profile = profile.sort_values(["Source report", "Step occurrence", "Date time"], kind="stable")
@@ -1094,4 +1146,3 @@ with tabs[9]:
     safe_table(pd.DataFrame(meta.items(),columns=["Field","Value"]),height=430)
 
 st.caption("All PDFs are processed independently in memory. The app does not create or store Excel/CSV files.")
-
