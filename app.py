@@ -689,7 +689,11 @@ def build_multi_sensor_profile(profile, tags, title=None, y_ranges=None):
     y_ranges=y_ranges or {}
 
     d=profile.sort_values("Date time").copy()
-    d["Elapsed time (min)"]=(d["Date time"]-d["Date time"].min()).dt.total_seconds()/60
+    d["Date time"]=pd.to_datetime(d["Date time"],errors="coerce")
+    d=d.dropna(subset=["Date time"])
+    if d.empty:
+        return go.Figure()
+    d["Elapsed time (min)"]=(d["Date time"]-d["Date time"].min()).dt.total_seconds()/60.0
     fig=go.Figure()
     palette=px.colors.qualitative.Plotly + px.colors.qualitative.Safe + px.colors.qualitative.Set2
 
@@ -713,7 +717,7 @@ def build_multi_sensor_profile(profile, tags, title=None, y_ranges=None):
     for i,tag in enumerate(tags):
         if tag not in d.columns:
             continue
-        g=d[["Date time",tag,"Batch","Step status"]].dropna(subset=[tag]).sort_values("Date time")
+        g=d[["Date time","Elapsed time (min)",tag,"Batch","Step status"]].dropna(subset=[tag]).sort_values("Elapsed time (min)")
         if g.empty:
             continue
         fig.add_trace(go.Scatter(
@@ -1039,7 +1043,7 @@ def safe_table(df,height=650,max_rows=3000,key=None):
     st.dataframe(view,width="stretch",hide_index=True,height=height,row_height=31,key=key)
 
 st.title("Universal ADAM and OMCA ANFDA Multi-Report Extractor")
-st.caption("Build: INTERACTIVE-MULTI-SENSOR-v12 | Manual Y-axis limits")
+st.caption("Build: INTERACTIVE-MULTI-SENSOR-v12.1 | Elapsed-time KeyError fixed")
 st.caption("Fast extraction uses Poppler pdftotext, then applies the selected ADAM or OMCA parser. Multiple reports are supported without automatic detection delay.")
 uploads=st.sidebar.file_uploader(
     "Upload multiple report PDFs",
