@@ -720,11 +720,24 @@ def build_single_sensor_profile(profile, tag, title=None):
 
     fig.update_layout(
         title=dict(text=title or f"{tag} Process Profile with Step Segmentation",x=0.5,xanchor="center",font=dict(size=23,color="#111111")),
-        height=620,template="plotly_white",paper_bgcolor="white",plot_bgcolor="white",
-        margin=dict(l=80,r=35,t=95,b=160),hovermode="x unified",
-        legend=dict(orientation="h",x=0.5,y=-0.16,xanchor="center",yanchor="top",title=dict(text="Process status"),font=dict(size=10)),
-        xaxis=dict(title="Date time",showgrid=True,gridcolor="#EEF0F2",tickformat="%d-%m %H:%M"),
-        yaxis=dict(title=y_title,showgrid=True,gridcolor="#E6E8EB",zeroline=False),
+        height=700,template="plotly_white",paper_bgcolor="white",plot_bgcolor="white",
+        margin=dict(l=80,r=35,t=110,b=205),hovermode="x unified",dragmode="zoom",
+        legend=dict(orientation="h",x=0.5,y=-0.27,xanchor="center",yanchor="top",title=dict(text="Process status"),font=dict(size=10)),
+        xaxis=dict(
+            title="Date time",showgrid=True,gridcolor="#EEF0F2",tickformat="%d-%m %H:%M",
+            rangeslider=dict(visible=True,thickness=0.08),
+            rangeselector=dict(
+                buttons=[
+                    dict(count=10,label="10m",step="minute",stepmode="backward"),
+                    dict(count=30,label="30m",step="minute",stepmode="backward"),
+                    dict(count=1,label="1h",step="hour",stepmode="backward"),
+                    dict(step="all",label="All"),
+                ],x=0.0,y=1.10,
+            ),
+            showspikes=True,spikemode="across",spikesnap="cursor",spikethickness=1,
+        ),
+        yaxis=dict(title=y_title,showgrid=True,gridcolor="#E6E8EB",zeroline=False,fixedrange=False,
+                   showspikes=True,spikemode="across",spikesnap="cursor"),
     )
     return fig
 
@@ -741,6 +754,10 @@ def show_plot_with_downloads(fig, chart_key, file_stem, height=None):
     plot_config={
         "displaylogo": False,
         "responsive": True,
+        "scrollZoom": True,
+        "doubleClick": "reset+autosize",
+        "showTips": True,
+        "modeBarButtonsToAdd": ["drawline","drawopenpath","drawrect","eraseshape","toggleSpikelines"],
         "toImageButtonOptions": {
             "format": "png",
             "filename": safe_name,
@@ -750,7 +767,7 @@ def show_plot_with_downloads(fig, chart_key, file_stem, height=None):
         },
     }
     st.plotly_chart(fig, width="stretch", key=chart_key, config=plot_config)
-    st.caption("PNG: click the camera icon in the plot toolbar. HTML: use the button below.")
+    st.caption("Interactive: hover for values, drag to zoom, mouse wheel to zoom, double-click to reset, use the range slider or 10m/30m/1h/All buttons. Camera icon downloads PNG.")
     html_bytes=fig.to_html(full_html=True, include_plotlyjs=True, config=plot_config).encode("utf-8")
     st.download_button(
         "Download interactive HTML",
@@ -780,7 +797,7 @@ def safe_table(df,height=650,max_rows=3000,key=None):
     st.dataframe(view,width="stretch",hide_index=True,height=height,row_height=31,key=key)
 
 st.title("Universal ADAM and OMCA ANFDA Multi-Report Extractor")
-st.caption("Build: SINGLE-SENSOR-PROFILE-v6 | One graph per sensor")
+st.caption("Build: INTERACTIVE-SINGLE-SENSOR-v7 | Zoom, pan, hover, range slider")
 st.caption("Fast extraction uses Poppler pdftotext, then applies the selected ADAM or OMCA parser. Multiple reports are supported without automatic detection delay.")
 uploads=st.sidebar.file_uploader(
     "Upload multiple report PDFs",
@@ -820,7 +837,7 @@ for idx,uploaded in enumerate(uploads):
     )
 
 @st.cache_data(show_spinner=False, max_entries=2, ttl=1800)
-def process_uploaded_report(file_name, raw, selected_type, parser_version="single-sensor-profile-v6"):
+def process_uploaded_report(file_name, raw, selected_type, parser_version="interactive-single-sensor-v7"):
     pages,extraction_engine,text_extraction_seconds=extract_pdf_pages(raw)
     tag_inventory=scan_report_tag_headers(pages)
     detected_type=selected_type
@@ -868,7 +885,7 @@ if process_now:
         selected_type=report_type_by_file[uploaded.name]
         progress.progress(i/len(uploads),text=f"Extracting {uploaded.name} as {selected_type} ({i+1} of {len(uploads)})")
         try:
-            reports.append(process_uploaded_report(uploaded.name,uploaded.getvalue(),selected_type,"single-sensor-profile-v6"))
+            reports.append(process_uploaded_report(uploaded.name,uploaded.getvalue(),selected_type,"interactive-single-sensor-v7"))
         except Exception as exc:
             reports.append({"file_name":uploaded.name,"detected_type":"Failed","error":str(exc),"long_df":pd.DataFrame(),"events":pd.DataFrame(),"alarms":pd.DataFrame(),"groups":{},"meta":{"File name":uploaded.name},"adam_score":0,"omca_score":0})
         gc.collect()
@@ -1048,7 +1065,7 @@ with tabs[2]:
                     sensor_fig,
                     chart_key=f"single_sensor_v6_{selected_batch}_{tag}_{selected['start']:%Y%m%d%H%M}",
                     file_stem=f"{selected_batch}_{tag}_segmented_{selected['start']:%Y%m%d_%H%M}",
-                    height=620,
+                    height=700,
                 )
             display_columns=["Source report","Batch","Date time","Step status"]+render_tags
             safe_table(chronological[display_columns],height=650,max_rows=max(3000,len(chronological)),key=f"single_sensor_table_v6_{selected_batch}_{selected['start']:%Y%m%d%H%M}")
