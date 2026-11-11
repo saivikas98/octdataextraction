@@ -678,7 +678,7 @@ def identify_profile_windows(data, selected_steps, gap_minutes=10):
         options.append({"id":window_id,"label":label,"start":start,"end":end,"gain":gain,"steps":steps})
     return d,options
 
-def build_multi_sensor_profile(profile, tags, title=None):
+def build_multi_sensor_profile(profile, tags, title=None, y_ranges=None):
     """Overlay multiple selected sensors in one interactive graph.
 
     Sensors are assigned to separate Y-axis families so weight, temperature,
@@ -686,6 +686,7 @@ def build_multi_sensor_profile(profile, tags, title=None):
     """
     if profile.empty or not tags:
         return go.Figure()
+    y_ranges=y_ranges or {}
 
     d=profile.sort_values("Date time").copy()
     d["Elapsed time (min)"]=(d["Date time"]-d["Date time"].min()).dt.total_seconds()/60
@@ -770,6 +771,12 @@ def build_multi_sensor_profile(profile, tags, title=None):
             spikemode="across",
             spikesnap="cursor",
         )
+        family_tags=[tag for tag in tags if sensor_family(tag)==fam and tag in y_ranges]
+        if family_tags:
+            axis_layout[key]["range"]=[
+                min(y_ranges[tag][0] for tag in family_tags),
+                max(y_ranges[tag][1] for tag in family_tags),
+            ]
         if i>0:
             axis_layout[key].update(
                 overlaying="y",
@@ -817,10 +824,11 @@ def build_multi_sensor_profile(profile, tags, title=None):
     )
     return fig
 
-def build_cross_batch_sensor_profile(profile, tags, title):
+def build_cross_batch_sensor_profile(profile, tags, title, y_ranges=None):
     """Overlay selected batches with elapsed minutes below and actual date/time above."""
     if profile.empty or not tags:
         return go.Figure()
+    y_ranges=y_ranges or {}
     fig=go.Figure()
     palette=px.colors.qualitative.Plotly+px.colors.qualitative.Safe+px.colors.qualitative.Set2
 
@@ -865,6 +873,11 @@ def build_cross_batch_sensor_profile(profile, tags, title):
     for i,fam in enumerate(families):
         key="yaxis" if i==0 else f"yaxis{i+1}"
         axis_layout[key]=dict(title=fam,showgrid=(i==0),gridcolor="#E6E8EB",zeroline=False,fixedrange=False)
+        family_tags=[tag for tag in tags if sensor_family(tag)==fam and tag in y_ranges]
+        if family_tags:
+            family_min=min(y_ranges[tag][0] for tag in family_tags)
+            family_max=max(y_ranges[tag][1] for tag in family_tags)
+            axis_layout[key]["range"]=[family_min,family_max]
         if i>0: axis_layout[key].update(overlaying="y",side="right",position=max(.78,1-(i-1)*.08))
     fig.update_layout(
         title=dict(text=title,x=.5,xanchor="center",font=dict(size=23)),height=760,
@@ -876,7 +889,7 @@ def build_cross_batch_sensor_profile(profile, tags, title):
     )
     return fig
 
-def build_single_sensor_profile(profile, tag, title=None):
+def build_single_sensor_profile(profile, tag, title=None, y_range=None):
     """Plot one sensor from sequence start to end with process-step highlighting."""
     if profile.empty or tag not in profile.columns:
         return go.Figure()
@@ -953,6 +966,8 @@ def build_single_sensor_profile(profile, tag, title=None):
         yaxis=dict(title=y_title,showgrid=True,gridcolor="#E6E8EB",zeroline=False,fixedrange=False,
                    showspikes=True,spikemode="across",spikesnap="cursor"),
     )
+    if y_range is not None and y_range[1]>y_range[0]:
+        fig.update_yaxes(range=[y_range[0],y_range[1]],autorange=False)
     return fig
 
 
@@ -1024,7 +1039,7 @@ def safe_table(df,height=650,max_rows=3000,key=None):
     st.dataframe(view,width="stretch",hide_index=True,height=height,row_height=31,key=key)
 
 st.title("Universal ADAM and OMCA ANFDA Multi-Report Extractor")
-st.caption("Build: INTERACTIVE-MULTI-SENSOR-v11.1 | Statistics fix + adjustable graph fonts")
+st.caption("Build: INTERACTIVE-MULTI-SENSOR-v12 | Manual Y-axis limits")
 st.caption("Fast extraction uses Poppler pdftotext, then applies the selected ADAM or OMCA parser. Multiple reports are supported without automatic detection delay.")
 uploads=st.sidebar.file_uploader(
     "Upload multiple report PDFs",
@@ -1285,25 +1300,65 @@ with tabs[2]:
         with c3:
             selected_load=st.multiselect("Load-cell sensors",loadcell_tags,default=[x for x in ["LSICR004","LSICR005"] if x in loadcell_tags],key="multi_batch_load_v9")
         selected_tags=list(dict.fromkeys(selected_load+selected_pressure+selected_temp))[:12]
+
+        st.markdown("#### Manual Y-axis limits")
+        manual_y_axis=st.checkbox(
+            "Set Y-axis minimum and maximum manually",
+            value=False,
+            key="manual_y_axis_v12",
+        )
+        y_axis_ranges={}
+        if manual_y_axis and selected_tags:
+            for axis_tag in selected_tags:
+                numeric_values=pd.to_numeric(chronological[axis_tag],errors="coerce").dropna() if axis_tag in chronological.columns else pd.Series(dtype=float)
+                if numeric_values.empty:
+                    continue
+                observed_min=float(numeric_values.min())
+                observed_max=float(numeric_values.max())
+                span=max(observed_max-observed_min,abs(observed_max)*0.05,1.0)
+                default_min=observed_min-0.05*span
+                default_max=observed_max+0.05*span
+                yc1,yc2,yc3=st.columns([1.2,1,1])
+                with yc1:
+                    st.write(f"**{axis_tag}**  \nObserved: {observed_min:.3f} to {observed_max:.3f}")
+                with yc2:
+                    selected_y_min=st.number_input(
+                        f"{axis_tag} minimum",
+                        value=float(default_min),
+                        format="%.3f",
+                        key=f"y_min_{axis_tag}_v12",
+                    )
+                with yc3:
+                    selected_y_max=st.number_input(
+                        f"{axis_tag} maximum",
+                        value=float(default_max),
+                        format="%.3f",
+                        key=f"y_max_{axis_tag}_v12",
+                    )
+                if selected_y_max<=selected_y_min:
+                    st.warning(f"{axis_tag}: maximum must be greater than minimum. Automatic scaling will be used for this tag.")
+                else:
+                    y_axis_ranges[axis_tag]=(float(selected_y_min),float(selected_y_max))
+
         plot_mode=st.radio("Plot mode",["Multiple selected sensors in one plot","Individual plot for each sensor"],horizontal=True,key="multi_batch_plot_mode_v9")
         if not selected_tags:
             st.info("Select at least one sensor.")
         elif len(selected_batches)>1:
             if plot_mode.startswith("Multiple"):
-                fig=build_cross_batch_sensor_profile(chronological,selected_tags,f"{', '.join(selected_batches)} | Multi-Sensor Cross-Batch Profile")
+                fig=build_cross_batch_sensor_profile(chronological,selected_tags,f"{', '.join(selected_batches)} | Multi-Sensor Cross-Batch Profile",y_ranges=y_axis_ranges)
                 show_plot_with_downloads(fig,"cross_batch_multi_v9",f"{'_'.join(selected_batches)}_multi_sensor",740)
             else:
                 for tag in selected_tags:
-                    fig=build_cross_batch_sensor_profile(chronological,[tag],f"{tag} Cross-Batch Profile")
+                    fig=build_cross_batch_sensor_profile(chronological,[tag],f"{tag} Cross-Batch Profile",y_ranges=y_axis_ranges)
                     show_plot_with_downloads(fig,f"cross_batch_{tag}_v9",f"{'_'.join(selected_batches)}_{tag}",700)
         else:
             one=chronological[chronological["Batch"].astype(str)==selected_batches[0]].copy()
             if plot_mode.startswith("Multiple"):
-                fig=build_multi_sensor_profile(one,selected_tags,f"{selected_batches[0]} | Multi-Sensor Process Profile")
+                fig=build_multi_sensor_profile(one,selected_tags,f"{selected_batches[0]} | Multi-Sensor Process Profile",y_ranges=y_axis_ranges)
                 show_plot_with_downloads(fig,"single_batch_multi_v9",f"{selected_batches[0]}_multi_sensor",740)
             else:
                 for tag in selected_tags:
-                    fig=build_single_sensor_profile(one,tag,f"{selected_batches[0]} | {tag} Process Profile")
+                    fig=build_single_sensor_profile(one,tag,f"{selected_batches[0]} | {tag} Process Profile",y_range=y_axis_ranges.get(tag))
                     show_plot_with_downloads(fig,f"single_batch_{tag}_v9",f"{selected_batches[0]}_{tag}",700)
         display_columns=["Source report","Batch","Date time","Elapsed time (min)","Step status"]+selected_tags
         safe_table(chronological[display_columns],height=650,max_rows=max(3000,len(chronological)),key="multi_batch_profile_table_v9")
