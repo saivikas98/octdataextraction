@@ -570,6 +570,47 @@ def parse_omca_anfd_report(pages):
     groups={"OMCA ANFDA Drying":wide_df}
     return groups,long_df,pd.DataFrame(),pd.DataFrame(alarms)
 
+
+def build_cross_batch_wide(valid_reports):
+    """Reconstruct one wide process table per uploaded report."""
+    frames = []
+    for item in valid_reports:
+        d = item.get("long_df", pd.DataFrame()).copy()
+        if d.empty or not {"Date time", "Instrument tag", "Value", "Step status"}.issubset(d.columns):
+            continue
+        d["Instrument tag"] = d["Instrument tag"].astype(str)
+        wide = (d[["Date time", "Instrument tag", "Value"]]
+                .drop_duplicates(["Date time", "Instrument tag"], keep="first")
+                .pivot(index="Date time", columns="Instrument tag", values="Value")
+                .reset_index())
+        status = d[["Date time", "Step status"]].drop_duplicates("Date time", keep="first")
+        wide = wide.merge(status, on="Date time", how="left")
+        meta = item.get("meta", {})
+        batch = meta.get("Batch number", item["file_name"]) if isinstance(meta, dict) else item["file_name"]
+        wide.insert(0, "Source report", item["file_name"])
+        wide.insert(1, "Batch", str(batch))
+        frames.append(wide)
+    return pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
+
+
+def make_step_elapsed_profile(wide_df, selected_steps):
+    """Align every contiguous step occurrence at elapsed time zero."""
+    parts = []
+    for report, g in wide_df.groupby("Source report", sort=False):
+        g = g.sort_values("Date time").copy()
+        g = g[g["Step status"].astype(str).isin(selected_steps)].copy()
+        if g.empty:
+            continue
+        gap = g["Date time"].diff().dt.total_seconds().div(60)
+        g["Step occurrence"] = (g["Step status"].ne(g["Step status"].shift()) | gap.gt(5)).cumsum()
+        g["Elapsed time (min)"] = g.groupby("Step occurrence")["Date time"].transform(
+            lambda x: (x - x.min()).dt.total_seconds() / 60
+        )
+        g["Profile label"] = (g["Batch"].astype(str) + " | " + g["Step status"].astype(str)
+                              + " | Run " + g["Step occurrence"].astype(str))
+        parts.append(g)
+    return pd.concat(parts, ignore_index=True, sort=False) if parts else pd.DataFrame()
+
 def safe_table(df,height=650,max_rows=3000,key=None):
     df=df.copy()
     if isinstance(df.index,pd.MultiIndex):
@@ -769,7 +810,7 @@ m3.metric("Active report tags",len(tags)); m4.metric("Active tag readings",f"{le
 summary=(long_df.groupby(["Instrument tag","HMI equipment","HMI measurement name","Unit"],dropna=False,observed=True,as_index=False)
     .agg(Records=("Value","size"),Start=("Date time","min"),End=("Date time","max"),Minimum=("Value","min"),Maximum=("Value","max"),Mean=("Value","mean")))
 
-tabs=st.tabs(["Selected tag","Tag summary","Extraction audit","Transfer flowrate","HMI tag dictionary","Instrument groups","All tagwise data","Events & alarms","Metadata"])
+tabs=st.tabs(["Selected tag","Tag summary", "Cross-batch profiles","Extraction audit","Transfer flowrate","HMI tag dictionary","Instrument groups","All tagwise data","Events & alarms","Metadata"])
 with tabs[0]:
     selected_equipment=tag_df["HMI equipment"].iloc[0] if not tag_df.empty else ""
     selected_measurement=tag_df["HMI measurement name"].iloc[0] if not tag_df.empty else ""
@@ -783,13 +824,60 @@ with tabs[0]:
 with tabs[1]:
     safe_table(summary,height=600)
 with tabs[2]:
+    st.subheader("MV04/MV05 cross-batch process profiles")
+    st.caption("Compare vessel weight, pressure, temperature and agitator profiles across uploaded ADAM batches. Elapsed-time alignment starts every selected step at 0 minutes.")
+    cross_wide = build_cross_batch_wide(valid)
+    if cross_wide.empty:
+        st.info("Process at least one ADAM Process report to create profiles.")
+    else:
+        profile_steps = sorted(x for x in cross_wide["Step status"].dropna().astype(str).unique() if x.strip())
+        requested_defaults = [
+            "TRANSFER FROM MV01 TO MV04", "MV03 DEPRESSURISE",
+            "TRANSFER API FROM MV03 TO MV04", "MV04 AGITATION",
+            "CHECKS BEFORE COACERVATION", "MANUAL PROMPT",
+            "TRANSFER FROM SFV01 TO MV04",
+        ]
+        default_steps = [x for x in requested_defaults if x in profile_steps]
+        selected_steps = st.multiselect("Step names", profile_steps, default=default_steps, key="profile_steps")
+        profile_tags = [x for x in ["LSICR004", "LSICR005", "PICR006", "TICR008", "TA005"] if x in cross_wide.columns]
+        selected_tags = st.multiselect("Profile tags", profile_tags, default=profile_tags, key="profile_tags")
+        x_mode = st.radio("X-axis", ["Elapsed time from step start", "Actual date/time"], horizontal=True, key="profile_x_mode")
+        if not selected_steps or not selected_tags:
+            st.info("Select at least one step and one tag.")
+        else:
+            profile = make_step_elapsed_profile(cross_wide, selected_steps)
+            if profile.empty:
+                st.info("No records match the selected steps.")
+            else:
+                x_col = "Elapsed time (min)" if x_mode.startswith("Elapsed") else "Date time"
+                plot_profile = profile.iloc[::max(1, len(profile)//12000)].copy()
+                titles = {
+                    "LSICR004": "MV04 vessel weight (kg)",
+                    "LSICR005": "MV05 vessel weight (kg)",
+                    "PICR006": "MV05 pressure (bar)",
+                    "TICR008": "MV05 temperature (°C)",
+                    "TA005": "MV05 agitator speed (RPM)",
+                }
+                for tag in selected_tags:
+                    chart = plot_profile[[x_col, "Profile label", "Batch", "Step status", tag]].dropna(subset=[tag])
+                    if chart.empty:
+                        continue
+                    fig = px.line(chart, x=x_col, y=tag, color="Profile label", line_group="Profile label",
+                                  markers=True, title=titles.get(tag, tag), hover_data=["Batch", "Step status"])
+                    fig.update_layout(height=430, legend_title_text="Batch | Step | Run")
+                    st.plotly_chart(fig, use_container_width=True, key=f"profile_{tag}_{x_mode}")
+                columns = ["Source report", "Batch", "Date time", "Elapsed time (min)", "Step status"] + selected_tags
+                safe_table(profile[columns].sort_values(["Source report", "Step occurrence", "Date time"]),
+                           height=650, max_rows=max(3000, len(profile)), key="cross_batch_profile_table")
+
+with tabs[3]:
     st.subheader("Report tag extraction audit")
     st.caption("This table distinguishes tags that are printed in the PDF report from tags that exist only on the HMI. HMI mapping cannot create historical values that are absent from the PDF.")
     if tag_inventory.empty:
         st.info("No cycle/event tag headers were found in this report format.")
     else:
         safe_table(tag_inventory.sort_values(["Extraction status","Canonical tag"]),height=650,max_rows=10000,key="tag_audit")
-with tabs[3]:
+with tabs[4]:
     st.subheader("Interval-by-interval material-transfer flowrate")
     st.caption("Flowrate is calculated at every consecutive sampling interval. No average or transfer-episode aggregation is applied.")
     if flow_points.empty:
@@ -816,18 +904,18 @@ with tabs[3]:
             cols=["Previous time","Date time","Instrument tag","Vessel","Destination / route","Previous weight (kg)","Smoothed weight (kg)","Weight change (kg)","Interval (min)","Signed flow (kg/min)","Flowrate (kg/min)","Flowrate (kg/h)","Transfer direction","Step status","Source page"]
             safe_table(measurable[cols],height=650,max_rows=max(3000,len(measurable)),key=f"interval_flow_{active_name}_{flow_tag}_{flow_step}")
 
-with tabs[4]:
+with tabs[5]:
     mapping=long_df[["Instrument tag","HMI equipment","HMI measurement name","Unit"]].drop_duplicates().sort_values(["HMI equipment","Instrument tag"])
     safe_table(mapping,height=650)
-with tabs[5]:
+with tabs[6]:
     group_name=st.selectbox("Instrument group",list(groups.keys()))
     safe_table(groups[group_name])
-with tabs[6]:
+with tabs[7]:
     search=st.text_input("Search tag, status, unit or timestamp")
     view=long_df
     if search: view=view[view.astype(str).apply(lambda x:x.str.contains(search,case=False,na=False)).any(axis=1)]
     safe_table(view)
-with tabs[7]:
+with tabs[8]:
     a,b=st.columns(2)
     with a:
         st.subheader(f"Event records ({len(events):,})")
@@ -835,7 +923,7 @@ with tabs[7]:
     with b:
         st.subheader(f"Alarm records ({len(alarms):,})")
         safe_table(alarms,height=520) if not alarms.empty else st.info("No alarm records extracted.")
-with tabs[8]:
+with tabs[9]:
     safe_table(pd.DataFrame(meta.items(),columns=["Field","Value"]),height=430)
 
 st.caption("All PDFs are processed independently in memory. The app does not create or store Excel/CSV files.")
