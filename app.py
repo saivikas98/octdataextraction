@@ -670,37 +670,44 @@ def identify_profile_windows(data, selected_steps, gap_minutes=10):
         options.append({"id":window_id,"label":label,"start":start,"end":end,"gain":gain,"steps":steps})
     return d,options
 
-def build_segmented_multipanel(profile, tags, x_col="Date time", title="MV04/MV05 Process Profile with Step Segmentation"):
-    """Build the requested chronological multi-panel profile.
-
-    LSICR004 and LSICR005 share the first weight panel. Remaining tags use
-    separate panels. Step colours are based on chronological contiguous blocks.
-    """
-    if profile.empty:
+def build_segmented_multipanel(profile, tags, x_col="Date time", title="Process Profile with Step Segmentation", combine_loadcells=True):
+    """Build the only supported chart style: chronological stacked panels with step shading."""
+    if profile.empty or not tags:
         return go.Figure()
-
-    # One chronological batch/run only. Elapsed profiles overlap independent
-    # steps at x=0 and cannot create the requested continuous segmented figure.
     profile=profile.sort_values("Date time").copy()
     x_col="Date time"
-    weight_tags=[t for t in ["LSICR004","LSICR005"] if t in tags and t in profile.columns]
-    other_tags=[t for t in tags if t not in weight_tags and t in profile.columns]
+
+    def family(tag):
+        u=str(tag).upper()
+        if u.startswith("LSICR"): return "Load cell"
+        if u.startswith(("TICR","TT-")): return "Temperature"
+        if u.startswith(("PICR","PT-")): return "Pressure"
+        return "Other"
+
+    units={"Load cell":"kg","Temperature":"°C","Pressure":"bar","Other":""}
+    # Load cells can share the first panel like the requested figure; all other tags receive individual panels.
+    selected_load=[t for t in tags if family(t)=="Load cell" and t in profile.columns]
     panel_specs=[]
-    if weight_tags: panel_specs.append(("Weight (kg)",weight_tags))
-    for tag in other_tags:
-        labels={"PICR006":"PICR006 (bar)","TICR008":"TICR008 (°C)","TA005":"TA005 (RPM)"}
-        panel_specs.append((labels.get(tag,tag),[tag]))
+    if selected_load and combine_loadcells:
+        panel_specs.append(("Weight (kg)",selected_load,"Load cell"))
+    else:
+        panel_specs += [(f"{t} (kg)",[t],"Load cell") for t in selected_load]
+    for fam in ["Pressure","Temperature","Other"]:
+        for tag in [t for t in tags if family(t)==fam and t in profile.columns]:
+            suffix=units[fam]
+            panel_specs.append((f"{tag} ({suffix})" if suffix else tag,[tag],fam))
     if not panel_specs:
         return go.Figure()
 
     rows=len(panel_specs)
-    heights=[1.8]+[1.0]*(rows-1)
-    fig=make_subplots(rows=rows,cols=1,shared_xaxes=True,vertical_spacing=0.035,row_heights=heights)
-    trace_colors={"LSICR004":"#5B7BE9","LSICR005":"#E000A8","PICR006":"#9467BD","TICR008":"#D62728","TA005":"#2CA02C"}
-    trace_names={"LSICR004":"LSICR004 (MV04 weight)","LSICR005":"LSICR005 (MV05 weight)","PICR006":"PICR006","TICR008":"TICR008","TA005":"TA005"}
+    row_heights=[1.8]+[1.0]*(rows-1) if rows>1 else [1.0]
+    fig=make_subplots(rows=rows,cols=1,shared_xaxes=True,vertical_spacing=0.032,row_heights=row_heights)
+    palette=px.colors.qualitative.Plotly+px.colors.qualitative.Safe+px.colors.qualitative.Set2
+    tag_color={tag:palette[i%len(palette)] for i,tag in enumerate(tags)}
+    fixed_colors={"LSICR004":"#5B7BE9","LSICR005":"#E000A8","PICR006":"#9467BD","TICR008":"#D62728","TA005":"#2CA02C"}
+    tag_color.update(fixed_colors)
     step_colors=["#DDF3EF","#EEEAF6","#DCECF7","#E9F6CF","#F1F1F1","#E9F7EA","#FFF4BF","#FDE8E8"]
 
-    # Identify contiguous chronological step blocks.
     step_frame=profile[["Date time","Step status"]].drop_duplicates("Date time").sort_values("Date time").copy()
     gap=step_frame["Date time"].diff().dt.total_seconds().div(60)
     step_frame["_segment"]=(step_frame["Step status"].ne(step_frame["Step status"].shift())|gap.gt(5)).cumsum()
@@ -713,25 +720,22 @@ def build_segmented_multipanel(profile, tags, x_col="Date time", title="MV04/MV0
         for row in range(1,rows+1):
             fig.add_vrect(x0=x0,x1=x1,fillcolor=color,opacity=0.52,line_width=0,layer="below",row=row,col=1)
 
-    # Add engineering traces. Data legend is shown above the chart.
-    for row,(y_title,row_tags) in enumerate(panel_specs,1):
+    for row,(axis_title,row_tags,fam) in enumerate(panel_specs,1):
         for tag in row_tags:
             g=profile[["Date time",tag,"Step status","Batch"]].dropna(subset=[tag]).sort_values("Date time")
             if g.empty: continue
+            equipment_label=""
             fig.add_trace(go.Scatter(
-                x=g["Date time"],y=g[tag],mode="lines+markers",name=trace_names.get(tag,tag),
-                legendgroup=f"data_{tag}",legend="legend",line=dict(color=trace_colors.get(tag,"#1F77B4"),width=2.3),
-                marker=dict(size=5),customdata=g[["Batch","Step status"]].astype(str).to_numpy(),
-                hovertemplate="Batch=%{customdata[0]}<br>Step=%{customdata[1]}<br>Time=%{x|%d-%m-%Y %H:%M}<br>Value=%{y:.3f}<extra></extra>",
+                x=g["Date time"],y=g[tag],mode="lines+markers",name=tag,
+                legendgroup=f"data_{tag}",legend="legend",line=dict(color=tag_color[tag],width=2.3),marker=dict(size=5),
+                customdata=g[["Batch","Step status"]].astype(str).to_numpy(),
+                hovertemplate=f"Tag={tag}<br>Batch=%{{customdata[0]}}<br>Step=%{{customdata[1]}}<br>Time=%{{x|%d-%m-%Y %H:%M}}<br>Value=%{{y:.3f}}<extra></extra>",
             ),row=row,col=1)
-        fig.update_yaxes(title_text=y_title,row=row,col=1,showgrid=True,gridcolor="#E6E8EB",zeroline=False)
+        fig.update_yaxes(title_text=axis_title,row=row,col=1,showgrid=True,gridcolor="#E6E8EB",zeroline=False)
 
-    # Dynamic receipt annotations on the first panel.
-    if weight_tags and "LSICR004" in profile.columns:
-        for step,caption,ax,ay in [
-            ("TRANSFER FROM MV01 TO MV04","MV01→MV04",-20,-55),
-            ("TRANSFER FROM SFV01 TO MV04","SFV01→MV04",-120,-50),
-        ]:
+    # Transfer annotations when LSICR004 is selected.
+    if "LSICR004" in tags and "LSICR004" in profile.columns:
+        for step,caption,ax,ay in [("TRANSFER FROM MV01 TO MV04","MV01→MV04",-20,-55),("TRANSFER FROM SFV01 TO MV04","SFV01→MV04",-120,-50)]:
             a=profile[profile["Step status"].astype(str)==step].dropna(subset=["LSICR004"]).sort_values("Date time")
             if len(a)>=2:
                 first,last=a.iloc[0],a.iloc[-1]
@@ -739,20 +743,16 @@ def build_segmented_multipanel(profile, tags, x_col="Date time", title="MV04/MV0
                     text=f"{caption}: LSICR004 {first['LSICR004']:.2f}→{last['LSICR004']:.2f} kg",
                     showarrow=True,arrowhead=2,ax=ax,ay=ay,font=dict(size=11,color="#111827"))
 
-    # Separate process-status legend below the complete chart.
     for i,status in enumerate(status_order):
-        fig.add_trace(go.Scatter(
-            x=[None],y=[None],mode="markers",name=status,legendgroup=f"status_{i}",legend="legend2",
-            marker=dict(size=14,symbol="square",color=step_colors[i%len(step_colors)]),hoverinfo="skip",
-        ),row=rows,col=1)
+        fig.add_trace(go.Scatter(x=[None],y=[None],mode="markers",name=status,legendgroup=f"status_{i}",legend="legend2",
+            marker=dict(size=14,symbol="square",color=step_colors[i%len(step_colors)]),hoverinfo="skip"),row=rows,col=1)
 
     fig.update_layout(
         title=dict(text=title,x=0.5,xanchor="center",font=dict(size=24,color="#111111")),
-        height=max(720,245*rows+170),template="plotly_white",paper_bgcolor="white",plot_bgcolor="white",
-        margin=dict(l=85,r=35,t=115,b=165),hovermode="x unified",
-        legend=dict(orientation="h",x=0.01,y=1.01,xanchor="left",yanchor="bottom",title_text=""),
-        legend2=dict(orientation="h",x=0.5,y=-0.11,xanchor="center",yanchor="top",
-                     title=dict(text="Process status"),font=dict(size=10)),
+        height=max(720,235*rows+190),template="plotly_white",paper_bgcolor="white",plot_bgcolor="white",
+        margin=dict(l=90,r=35,t=120,b=175),hovermode="x unified",
+        legend=dict(orientation="h",x=0.01,y=1.01,xanchor="left",yanchor="bottom",title_text="Selected tags"),
+        legend2=dict(orientation="h",x=0.5,y=-0.11,xanchor="center",yanchor="top",title=dict(text="Process status"),font=dict(size=10)),
     )
     fig.update_xaxes(title_text="Date time",row=rows,col=1,showgrid=True,gridcolor="#EEF0F2",tickformat="%H:%M")
     return fig
@@ -809,7 +809,7 @@ def safe_table(df,height=650,max_rows=3000,key=None):
     st.dataframe(view,width="stretch",hide_index=True,height=height,row_height=31,key=key)
 
 st.title("Universal ADAM and OMCA ANFDA Multi-Report Extractor")
-st.caption("Build: EXACT-SEGMENTED-v4 | Start-to-end process sequence")
+st.caption("Build: EXACT-SEGMENTED-v5 | Dynamic segmented tag panels")
 st.caption("Fast extraction uses Poppler pdftotext, then applies the selected ADAM or OMCA parser. Multiple reports are supported without automatic detection delay.")
 uploads=st.sidebar.file_uploader(
     "Upload multiple report PDFs",
@@ -849,7 +849,7 @@ for idx,uploaded in enumerate(uploads):
     )
 
 @st.cache_data(show_spinner=False, max_entries=2, ttl=1800)
-def process_uploaded_report(file_name, raw, selected_type, parser_version="exact-segmented-v4-sequence"):
+def process_uploaded_report(file_name, raw, selected_type, parser_version="exact-segmented-v5-dynamic-tags"):
     pages,extraction_engine,text_extraction_seconds=extract_pdf_pages(raw)
     tag_inventory=scan_report_tag_headers(pages)
     detected_type=selected_type
@@ -897,7 +897,7 @@ if process_now:
         selected_type=report_type_by_file[uploaded.name]
         progress.progress(i/len(uploads),text=f"Extracting {uploaded.name} as {selected_type} ({i+1} of {len(uploads)})")
         try:
-            reports.append(process_uploaded_report(uploaded.name,uploaded.getvalue(),selected_type,"exact-segmented-v4-sequence"))
+            reports.append(process_uploaded_report(uploaded.name,uploaded.getvalue(),selected_type,"exact-segmented-v5-dynamic-tags"))
         except Exception as exc:
             reports.append({"file_name":uploaded.name,"detected_type":"Failed","error":str(exc),"long_df":pd.DataFrame(),"events":pd.DataFrame(),"alarms":pd.DataFrame(),"groups":{},"meta":{"File name":uploaded.name},"adam_score":0,"omca_score":0})
         gc.collect()
@@ -1009,61 +1009,68 @@ with tabs[0]:
 with tabs[1]:
     safe_table(summary,height=600)
 with tabs[2]:
-    st.subheader("MV04/MV05 Process Profile with Step Segmentation")
-    st.caption("Choose the sequence start and end steps. The plot includes every intermediate process row and prevents unrelated operation periods from being connected.")
+    st.subheader("Process Profile with Step Segmentation")
+    st.caption("Only the chronological stacked profile is generated. Select temperature, pressure and load-cell tags; each selected sensor is plotted in its own panel, except load cells can share the weight panel.")
     cross_wide=build_cross_batch_wide(valid)
     if cross_wide.empty:
         st.info("Process at least one ADAM Process report to create the segmented profile.")
     else:
         available_batches=sorted(x for x in cross_wide["Batch"].dropna().astype(str).unique() if x.strip())
-        selected_batch=st.selectbox("Batch number",available_batches,key="exact_segmented_batch_v4")
+        selected_batch=st.selectbox("Batch number",available_batches,key="segmented_batch_v5")
         one_batch=cross_wide[cross_wide["Batch"].astype(str)==str(selected_batch)].sort_values("Date time").copy()
         all_steps=[]
         for value in one_batch["Step status"].dropna().astype(str):
             if value.strip() and value not in all_steps: all_steps.append(value)
-
-        preferred_start="TRANSFER FROM MV01 TO MV04"
-        preferred_end="TRANSFER FROM SFV01 TO MV04"
-        start_index=all_steps.index(preferred_start) if preferred_start in all_steps else 0
-        end_index=all_steps.index(preferred_end) if preferred_end in all_steps else max(0,len(all_steps)-1)
+        preferred_start="TRANSFER FROM MV01 TO MV04"; preferred_end="TRANSFER FROM SFV01 TO MV04"
         c_start,c_end,c_duration=st.columns([2,2,1])
         with c_start:
-            start_step=st.selectbox("Sequence start step",all_steps,index=start_index,key="sequence_start_v4")
+            start_step=st.selectbox("Sequence start step",all_steps,index=all_steps.index(preferred_start) if preferred_start in all_steps else 0,key="sequence_start_v5")
         with c_end:
-            end_step=st.selectbox("Sequence end step",all_steps,index=end_index,key="sequence_end_v4")
+            end_step=st.selectbox("Sequence end step",all_steps,index=all_steps.index(preferred_end) if preferred_end in all_steps else max(0,len(all_steps)-1),key="sequence_end_v5")
         with c_duration:
-            max_duration=st.number_input("Max duration (min)",min_value=10,max_value=1440,value=180,step=10,key="sequence_duration_v4")
+            max_duration=st.number_input("Max duration (min)",min_value=10,max_value=1440,value=180,step=10,key="sequence_duration_v5")
 
-        fixed_tags=[x for x in ["LSICR004","LSICR005","PICR006","TICR008","TA005"] if x in one_batch.columns]
-        st.write("**Fixed profile tags:** "+", ".join(fixed_tags))
+        columns=[str(c) for c in one_batch.columns]
+        temperature_tags=sorted(c for c in columns if c.upper().startswith(("TICR","TT-")))
+        pressure_tags=sorted(c for c in columns if c.upper().startswith(("PICR","PT-")))
+        loadcell_tags=sorted(c for c in columns if c.upper().startswith("LSICR"))
+        st.markdown("#### Select instrument tags")
+        c1,c2,c3=st.columns(3)
+        with c1:
+            all_temp=st.checkbox("Select all temperature tags",False,key="all_temp_v5")
+            default_temp=temperature_tags if all_temp else [x for x in ["TICR008"] if x in temperature_tags]
+            selected_temp=st.multiselect("Temperature sensors",temperature_tags,default=default_temp,key="temp_tags_v5")
+        with c2:
+            all_pressure=st.checkbox("Select all pressure tags",False,key="all_pressure_v5")
+            default_pressure=pressure_tags if all_pressure else [x for x in ["PICR006"] if x in pressure_tags]
+            selected_pressure=st.multiselect("Pressure sensors",pressure_tags,default=default_pressure,key="pressure_tags_v5")
+        with c3:
+            all_load=st.checkbox("Select all load-cell tags",False,key="all_load_v5")
+            default_load=loadcell_tags if all_load else [x for x in ["LSICR004","LSICR005"] if x in loadcell_tags]
+            selected_load=st.multiselect("Load-cell tags",loadcell_tags,default=default_load,key="load_tags_v5")
+            combine_loadcells=st.checkbox("Combine selected load cells in one weight panel",True,key="combine_load_v5")
+        selected_tags=list(dict.fromkeys(selected_load+selected_pressure+selected_temp))
+
         sequences=identify_process_sequences(one_batch,start_step,end_step,max_duration)
-        if not fixed_tags:
-            st.warning("The selected report does not contain the required profile tags.")
+        if not selected_tags:
+            st.info("Select at least one temperature, pressure or load-cell tag.")
         elif not sequences:
-            st.warning("No start-to-end sequence was found. Increase Max duration or select another start/end step pair.")
+            st.warning("No matching start-to-end sequence was found. Increase Max duration or change the boundary steps.")
         else:
-            # Prefer the sequence with the greatest positive MV04 gain, then the shortest duration.
             default_sequence=max(range(len(sequences)),key=lambda i:(sequences[i]["gain"],-sequences[i]["duration"]))
-            selected_label=st.selectbox("Matching process sequence",[x["label"] for x in sequences],index=default_sequence,key="matching_sequence_v4")
+            selected_label=st.selectbox("Matching process sequence",[x["label"] for x in sequences],index=default_sequence,key="matching_sequence_v5")
             selected=next(x for x in sequences if x["label"]==selected_label)
             chronological=selected["data"].copy().sort_values("Date time")
             m1,m2,m3,m4=st.columns(4)
             m1.metric("Sequence start",selected["start"].strftime("%d-%m-%Y %H:%M"))
             m2.metric("Sequence end",selected["end"].strftime("%d-%m-%Y %H:%M"))
-            m3.metric("Duration (min)",f"{selected['duration']:.0f}")
-            m4.metric("Rows",f"{len(chronological):,}")
-            combined_fig=build_segmented_multipanel(
-                chronological,tags=fixed_tags,x_col="Date time",
-                title="MV04/MV05 Process Profile with Step Segmentation",
-            )
-            show_plot_with_downloads(
-                combined_fig,
-                chart_key=f"exact_segmented_v4_{selected_batch}_{selected['start']:%Y%m%d%H%M}",
-                file_stem=f"MV04_MV05_segmented_{selected_batch}_{selected['start']:%Y%m%d_%H%M}",
-                height=max(900,245*(1+len([t for t in fixed_tags if t not in ["LSICR004","LSICR005"]]))+260),
-            )
-            display_columns=["Source report","Batch","Date time","Step status"]+fixed_tags
-            safe_table(chronological[display_columns],height=650,max_rows=max(3000,len(chronological)),key=f"sequence_table_v4_{selected_batch}_{selected['start']:%Y%m%d%H%M}")
+            m3.metric("Selected tags",len(selected_tags)); m4.metric("Rows",f"{len(chronological):,}")
+            fig_title=f"{selected_batch} Process Profile with Step Segmentation"
+            combined_fig=build_segmented_multipanel(chronological,tags=selected_tags,x_col="Date time",title=fig_title,combine_loadcells=combine_loadcells)
+            show_plot_with_downloads(combined_fig,chart_key=f"segmented_v5_{selected_batch}_{selected['start']:%Y%m%d%H%M}_{len(selected_tags)}",
+                file_stem=f"segmented_{selected_batch}_{selected['start']:%Y%m%d_%H%M}",height=max(800,235*(len(selected_tags)+1)))
+            display_columns=["Source report","Batch","Date time","Step status"]+selected_tags
+            safe_table(chronological[display_columns],height=650,max_rows=max(3000,len(chronological)),key=f"segmented_table_v5_{selected_batch}_{selected['start']:%Y%m%d%H%M}")
 
 with tabs[3]:
     st.subheader("Report tag extraction audit")
