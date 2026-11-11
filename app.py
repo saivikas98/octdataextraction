@@ -33,6 +33,14 @@ if st.sidebar.button("Clear application cache", type="primary", width="stretch",
 if st.session_state.pop("cache_cleared_notice", False):
     st.sidebar.success("Application cache cleared. Please upload the PDF again.")
 st.sidebar.caption("Use after updating app.py, changing report type, or seeing an old cached parsing error.")
+
+st.sidebar.subheader("Graph font controls")
+plot_title_font=st.sidebar.slider("Graph title font size",12,40,23,1,key="graph_title_font_v11")
+plot_axis_title_font=st.sidebar.slider("Axis-title font size",10,32,16,1,key="axis_title_font_v11")
+plot_tick_font=st.sidebar.slider("Axis tick-label font size",8,26,12,1,key="tick_font_v11")
+plot_legend_font=st.sidebar.slider("Legend font size",8,26,11,1,key="legend_font_v11")
+plot_hover_font=st.sidebar.slider("Hover-label font size",8,26,12,1,key="hover_font_v11")
+
 DATE_RE = re.compile(r"^(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2}:\d{2})\s+(.+)$")
 NUMBER_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
 TAG_RE = re.compile(r"^(?:LSICR|PICR|TICR|TA|TLP|RLS|CP|PT|TT|XV|DP|QI?CR|CI?CR|MFM)[A-Z0-9_-]*$", re.I)
@@ -948,6 +956,18 @@ def build_single_sensor_profile(profile, tag, title=None):
     return fig
 
 
+def apply_plot_font_sizes(fig):
+    """Apply sidebar-selected font sizes to every Plotly chart."""
+    fig.update_layout(
+        font=dict(size=plot_tick_font),
+        title_font=dict(size=plot_title_font),
+        legend=dict(font=dict(size=plot_legend_font),title_font=dict(size=plot_legend_font)),
+        hoverlabel=dict(font_size=plot_hover_font),
+    )
+    fig.update_xaxes(title_font=dict(size=plot_axis_title_font),tickfont=dict(size=plot_tick_font))
+    fig.update_yaxes(title_font=dict(size=plot_axis_title_font),tickfont=dict(size=plot_tick_font))
+    return fig
+
 def show_plot_with_downloads(fig, chart_key, file_stem, height=None):
     """Display a Plotly chart with browser-side PNG and HTML downloads.
 
@@ -956,6 +976,7 @@ def show_plot_with_downloads(fig, chart_key, file_stem, height=None):
     """
     if height:
         fig.update_layout(height=height)
+    fig=apply_plot_font_sizes(fig)
     safe_name=re.sub(r"[^A-Za-z0-9_-]+", "_", str(file_stem)).strip("_") or "plot"
     plot_config={
         "displaylogo": False,
@@ -1003,7 +1024,7 @@ def safe_table(df,height=650,max_rows=3000,key=None):
     st.dataframe(view,width="stretch",hide_index=True,height=height,row_height=31,key=key)
 
 st.title("Universal ADAM and OMCA ANFDA Multi-Report Extractor")
-st.caption("Build: INTERACTIVE-MULTI-SENSOR-v10 | Temperature statistics by step")
+st.caption("Build: INTERACTIVE-MULTI-SENSOR-v11.1 | Statistics fix + adjustable graph fonts")
 st.caption("Fast extraction uses Poppler pdftotext, then applies the selected ADAM or OMCA parser. Multiple reports are supported without automatic detection delay.")
 uploads=st.sidebar.file_uploader(
     "Upload multiple report PDFs",
@@ -1305,7 +1326,13 @@ with tabs[2]:
                 key="temperature_stats_batches_v10",
             )
         with stat_col2:
-            default_stat_tags=[x for x in ts if x in available_stat_temp_tags]
+            # Use the temperature tags selected in the profile controls.
+            # `selected_temp` is defined in this profile block; the previous
+            # variable name `ts` was undefined and caused a NameError.
+            default_stat_tags=[
+                x for x in selected_temp
+                if x in available_stat_temp_tags
+            ]
             stat_temp_tags=st.multiselect(
                 "Temperature sensor tags for statistics",
                 available_stat_temp_tags,
