@@ -800,6 +800,55 @@ def build_multi_sensor_profile(profile, tags, title=None):
     )
     return fig
 
+def build_cross_batch_sensor_profile(profile, tags, title):
+    """Overlay selected sensors and batches using elapsed time from sequence start."""
+    if profile.empty or not tags:
+        return go.Figure()
+    fig=go.Figure()
+    palette=px.colors.qualitative.Plotly+px.colors.qualitative.Safe+px.colors.qualitative.Set2
+
+    def sensor_family(tag):
+        upper=str(tag).upper()
+        if upper.startswith("LSICR"): return "Weight (kg)"
+        if upper.startswith(("TICR","TT-")): return "Temperature (°C)"
+        if upper.startswith(("PICR","PT-")): return "Pressure (bar)"
+        return "Value"
+
+    families=[]
+    for tag in tags:
+        fam=sensor_family(tag)
+        if fam not in families: families.append(fam)
+    axis_for={fam:("y" if i==0 else f"y{i+1}") for i,fam in enumerate(families)}
+    trace_index=0
+    for batch_name,batch_data in profile.groupby("Batch",sort=False):
+        for tag in tags:
+            if tag not in batch_data.columns: continue
+            g=batch_data.dropna(subset=[tag]).sort_values("Elapsed time (min)")
+            if g.empty: continue
+            fig.add_trace(go.Scatter(
+                x=g["Elapsed time (min)"],y=g[tag],mode="lines+markers",
+                name=f"{batch_name} | {tag}",yaxis=axis_for[sensor_family(tag)],
+                line=dict(width=2.3,color=palette[trace_index%len(palette)]),marker=dict(size=5),
+                customdata=g[["Batch","Step status","Date time"]].astype(str).to_numpy(),
+                hovertemplate=(f"Batch=%{{customdata[0]}}<br>Tag={tag}<br>Step=%{{customdata[1]}}<br>"
+                               "Elapsed=%{x:.1f} min<br>Actual time=%{customdata[2]}<br>Value=%{y:.3f}<extra></extra>"),
+            ))
+            trace_index+=1
+
+    axis_layout={}
+    for i,fam in enumerate(families):
+        key="yaxis" if i==0 else f"yaxis{i+1}"
+        axis_layout[key]=dict(title=fam,showgrid=(i==0),gridcolor="#E6E8EB",zeroline=False,fixedrange=False)
+        if i>0: axis_layout[key].update(overlaying="y",side="right",position=max(.78,1-(i-1)*.08))
+    fig.update_layout(
+        title=dict(text=title,x=.5,xanchor="center",font=dict(size=23)),height=740,
+        template="plotly_white",hovermode="x unified",dragmode="zoom",margin=dict(l=85,r=190,t=100,b=130),
+        legend=dict(orientation="h",x=.5,y=-.18,xanchor="center",yanchor="top",title="Batch | Sensor"),
+        xaxis=dict(title="Elapsed time from sequence start (min)",showgrid=True,gridcolor="#EEF0F2",showspikes=True),
+        **axis_layout,
+    )
+    return fig
+
 def build_single_sensor_profile(profile, tag, title=None):
     """Plot one sensor from sequence start to end with process-step highlighting."""
     if profile.empty or tag not in profile.columns:
@@ -926,7 +975,7 @@ def safe_table(df,height=650,max_rows=3000,key=None):
     st.dataframe(view,width="stretch",hide_index=True,height=height,row_height=31,key=key)
 
 st.title("Universal ADAM and OMCA ANFDA Multi-Report Extractor")
-st.caption("Build: INTERACTIVE-MULTI-SENSOR-v8.1 | Range slider removed")
+st.caption("Build: INTERACTIVE-MULTI-SENSOR-v9 | Multiple batch selection")
 st.caption("Fast extraction uses Poppler pdftotext, then applies the selected ADAM or OMCA parser. Multiple reports are supported without automatic detection delay.")
 uploads=st.sidebar.file_uploader(
     "Upload multiple report PDFs",
@@ -966,7 +1015,7 @@ for idx,uploaded in enumerate(uploads):
     )
 
 @st.cache_data(show_spinner=False, max_entries=2, ttl=1800)
-def process_uploaded_report(file_name, raw, selected_type, parser_version="interactive-multi-sensor-v8"):
+def process_uploaded_report(file_name, raw, selected_type, parser_version="interactive-multi-sensor-v9"):
     pages,extraction_engine,text_extraction_seconds=extract_pdf_pages(raw)
     tag_inventory=scan_report_tag_headers(pages)
     detected_type=selected_type
@@ -1014,7 +1063,7 @@ if process_now:
         selected_type=report_type_by_file[uploaded.name]
         progress.progress(i/len(uploads),text=f"Extracting {uploaded.name} as {selected_type} ({i+1} of {len(uploads)})")
         try:
-            reports.append(process_uploaded_report(uploaded.name,uploaded.getvalue(),selected_type,"interactive-multi-sensor-v8"))
+            reports.append(process_uploaded_report(uploaded.name,uploaded.getvalue(),selected_type,"interactive-multi-sensor-v9"))
         except Exception as exc:
             reports.append({"file_name":uploaded.name,"detected_type":"Failed","error":str(exc),"long_df":pd.DataFrame(),"events":pd.DataFrame(),"alarms":pd.DataFrame(),"groups":{},"meta":{"File name":uploaded.name},"adam_score":0,"omca_score":0})
         gc.collect()
@@ -1126,101 +1175,89 @@ with tabs[0]:
 with tabs[1]:
     safe_table(summary,height=600)
 with tabs[2]:
-    st.subheader("Individual Sensor Profiles with Step Segmentation")
-    st.caption("Each selected sensor is plotted in a separate graph from the selected sequence start time to end time. Different process steps are highlighted by background colour.")
+    st.subheader("Interactive Sensor Profiles with Step Segmentation")
+    st.caption("Select one or multiple batches. Single-batch plots retain process-step shading. Multiple-batch plots align each selected sequence at elapsed time zero for direct comparison.")
     cross_wide=build_cross_batch_wide(valid)
     if cross_wide.empty:
         st.info("Process at least one ADAM Process report to create sensor profiles.")
     else:
         available_batches=sorted(x for x in cross_wide["Batch"].dropna().astype(str).unique() if x.strip())
-        selected_batch=st.selectbox("Batch number",available_batches,key="single_sensor_batch_v6")
-        one_batch=cross_wide[cross_wide["Batch"].astype(str)==str(selected_batch)].sort_values("Date time").copy()
+        selected_batches=st.multiselect(
+            "Batch numbers",
+            available_batches,
+            default=available_batches[:1],
+            key="sensor_batches_v9",
+        )
+        if not selected_batches:
+            st.info("Select at least one batch number.")
+            st.stop()
+        selected_data=cross_wide[cross_wide["Batch"].astype(str).isin(selected_batches)].copy()
         all_steps=[]
-        for value in one_batch["Step status"].dropna().astype(str):
+        for value in selected_data.sort_values("Date time")["Step status"].dropna().astype(str):
             if value.strip() and value not in all_steps: all_steps.append(value)
         preferred_start="TRANSFER FROM MV01 TO MV04"; preferred_end="TRANSFER FROM SFV01 TO MV04"
         c_start,c_end,c_duration=st.columns([2,2,1])
         with c_start:
-            start_step=st.selectbox("Sequence start step",all_steps,index=all_steps.index(preferred_start) if preferred_start in all_steps else 0,key="single_start_v6")
+            start_step=st.selectbox("Sequence start step",all_steps,index=all_steps.index(preferred_start) if preferred_start in all_steps else 0,key="multi_batch_start_v9")
         with c_end:
-            end_step=st.selectbox("Sequence end step",all_steps,index=all_steps.index(preferred_end) if preferred_end in all_steps else max(0,len(all_steps)-1),key="single_end_v6")
+            end_step=st.selectbox("Sequence end step",all_steps,index=all_steps.index(preferred_end) if preferred_end in all_steps else max(0,len(all_steps)-1),key="multi_batch_end_v9")
         with c_duration:
-            max_duration=st.number_input("Max duration (min)",10,1440,180,10,key="single_duration_v6")
+            max_duration=st.number_input("Max duration (min)",10,1440,180,10,key="multi_batch_duration_v9")
 
-        columns=[str(c) for c in one_batch.columns]
+        sequence_parts=[]; sequence_rows=[]
+        for batch_name in selected_batches:
+            batch_data=selected_data[selected_data["Batch"].astype(str)==str(batch_name)].sort_values("Date time").copy()
+            matches=identify_process_sequences(batch_data,start_step,end_step,max_duration)
+            if not matches:
+                sequence_rows.append({"Batch":batch_name,"Status":"No matching sequence"})
+                continue
+            best=max(matches,key=lambda x:(x.get("gain",0),-x.get("duration",999999)))
+            part=best["data"].copy().sort_values("Date time")
+            part["Elapsed time (min)"]=(part["Date time"]-part["Date time"].min()).dt.total_seconds()/60
+            sequence_parts.append(part)
+            sequence_rows.append({"Batch":batch_name,"Status":"Included","Sequence":best["label"]})
+        if not sequence_parts:
+            st.warning("No matching process sequence was found for the selected batches.")
+            safe_table(pd.DataFrame(sequence_rows),height=300)
+            st.stop()
+        chronological=pd.concat(sequence_parts,ignore_index=True,sort=False)
+        with st.expander("Sequence selected for each batch"):
+            safe_table(pd.DataFrame(sequence_rows),height=300)
+
+        columns=[str(c) for c in chronological.columns]
         temperature_tags=sorted(c for c in columns if c.upper().startswith(("TICR","TT-")))
         pressure_tags=sorted(c for c in columns if c.upper().startswith(("PICR","PT-")))
         loadcell_tags=sorted(c for c in columns if c.upper().startswith("LSICR"))
-        st.markdown("#### Select sensors")
         c1,c2,c3=st.columns(3)
         with c1:
-            all_temp=st.checkbox("Select all temperature sensors",False,key="single_all_temp_v6")
-            selected_temp=st.multiselect("Temperature sensors",temperature_tags,default=temperature_tags if all_temp else [x for x in ["TICR008"] if x in temperature_tags],key="single_temp_v6")
+            selected_temp=st.multiselect("Temperature sensors",temperature_tags,default=[x for x in ["TICR008"] if x in temperature_tags],key="multi_batch_temp_v9")
         with c2:
-            all_pressure=st.checkbox("Select all pressure sensors",False,key="single_all_pressure_v6")
-            selected_pressure=st.multiselect("Pressure sensors",pressure_tags,default=pressure_tags if all_pressure else [x for x in ["PICR006"] if x in pressure_tags],key="single_pressure_v6")
+            selected_pressure=st.multiselect("Pressure sensors",pressure_tags,default=[x for x in ["PICR006"] if x in pressure_tags],key="multi_batch_pressure_v9")
         with c3:
-            all_load=st.checkbox("Select all load-cell sensors",False,key="single_all_load_v6")
-            selected_load=st.multiselect("Load-cell sensors",loadcell_tags,default=loadcell_tags if all_load else [x for x in ["LSICR004","LSICR005"] if x in loadcell_tags],key="single_load_v6")
-        selected_tags=list(dict.fromkeys(selected_load+selected_pressure+selected_temp))
-
-        sequences=identify_process_sequences(one_batch,start_step,end_step,max_duration)
+            selected_load=st.multiselect("Load-cell sensors",loadcell_tags,default=[x for x in ["LSICR004","LSICR005"] if x in loadcell_tags],key="multi_batch_load_v9")
+        selected_tags=list(dict.fromkeys(selected_load+selected_pressure+selected_temp))[:12]
+        plot_mode=st.radio("Plot mode",["Multiple selected sensors in one plot","Individual plot for each sensor"],horizontal=True,key="multi_batch_plot_mode_v9")
         if not selected_tags:
-            st.info("Select at least one temperature, pressure or load-cell sensor.")
-        elif not sequences:
-            st.warning("No matching start-to-end process sequence was found. Increase Max duration or change the boundary steps.")
-        else:
-            default_sequence=max(range(len(sequences)),key=lambda i:(sequences[i]["gain"],-sequences[i]["duration"]))
-            selected_label=st.selectbox("Matching process sequence",[x["label"] for x in sequences],index=default_sequence,key="single_sequence_v6")
-            selected=next(x for x in sequences if x["label"]==selected_label)
-            chronological=selected["data"].copy().sort_values("Date time")
-            m1,m2,m3,m4=st.columns(4)
-            m1.metric("Start",selected["start"].strftime("%d-%m-%Y %H:%M"))
-            m2.metric("End",selected["end"].strftime("%d-%m-%Y %H:%M"))
-            m3.metric("Duration (min)",f"{selected['duration']:.0f}")
-            m4.metric("Selected sensors",len(selected_tags))
-
-            plot_mode=st.radio(
-                "Plot mode",
-                ["Multiple selected sensors in one plot","Individual plot for each sensor"],
-                horizontal=True,
-                key="sensor_plot_mode_v8",
-            )
-            max_sensors=12
-            render_tags=selected_tags[:max_sensors]
-            if len(selected_tags)>max_sensors:
-                st.warning(
-                    f"{len(selected_tags)} sensors selected. The first {max_sensors} are rendered "
-                    "to protect Streamlit stability."
-                )
-
+            st.info("Select at least one sensor.")
+        elif len(selected_batches)>1:
             if plot_mode.startswith("Multiple"):
-                sensor_fig=build_multi_sensor_profile(
-                    chronological,
-                    tags=render_tags,
-                    title=f"{selected_batch} | Multi-Sensor Process Profile with Step Segmentation",
-                )
-                show_plot_with_downloads(
-                    sensor_fig,
-                    chart_key=f"multi_sensor_v8_{selected_batch}_{selected['start']:%Y%m%d%H%M}_{len(render_tags)}",
-                    file_stem=f"{selected_batch}_multi_sensor_segmented_{selected['start']:%Y%m%d_%H%M}",
-                    height=740,
-                )
+                fig=build_cross_batch_sensor_profile(chronological,selected_tags,f"{', '.join(selected_batches)} | Multi-Sensor Cross-Batch Profile")
+                show_plot_with_downloads(fig,"cross_batch_multi_v9",f"{'_'.join(selected_batches)}_multi_sensor",740)
             else:
-                for tag in render_tags:
-                    sensor_fig=build_single_sensor_profile(
-                        chronological,
-                        tag=tag,
-                        title=f"{selected_batch} | {tag} Process Profile with Step Segmentation",
-                    )
-                    show_plot_with_downloads(
-                        sensor_fig,
-                        chart_key=f"single_sensor_v8_{selected_batch}_{tag}_{selected['start']:%Y%m%d%H%M}",
-                        file_stem=f"{selected_batch}_{tag}_segmented_{selected['start']:%Y%m%d_%H%M}",
-                        height=700,
-                    )
-            display_columns=["Source report","Batch","Date time","Step status"]+render_tags
-            safe_table(chronological[display_columns],height=650,max_rows=max(3000,len(chronological)),key=f"single_sensor_table_v6_{selected_batch}_{selected['start']:%Y%m%d%H%M}")
+                for tag in selected_tags:
+                    fig=build_cross_batch_sensor_profile(chronological,[tag],f"{tag} Cross-Batch Profile")
+                    show_plot_with_downloads(fig,f"cross_batch_{tag}_v9",f"{'_'.join(selected_batches)}_{tag}",700)
+        else:
+            one=chronological[chronological["Batch"].astype(str)==selected_batches[0]].copy()
+            if plot_mode.startswith("Multiple"):
+                fig=build_multi_sensor_profile(one,selected_tags,f"{selected_batches[0]} | Multi-Sensor Process Profile")
+                show_plot_with_downloads(fig,"single_batch_multi_v9",f"{selected_batches[0]}_multi_sensor",740)
+            else:
+                for tag in selected_tags:
+                    fig=build_single_sensor_profile(one,tag,f"{selected_batches[0]} | {tag} Process Profile")
+                    show_plot_with_downloads(fig,f"single_batch_{tag}_v9",f"{selected_batches[0]}_{tag}",700)
+        display_columns=["Source report","Batch","Date time","Elapsed time (min)","Step status"]+selected_tags
+        safe_table(chronological[display_columns],height=650,max_rows=max(3000,len(chronological)),key="multi_batch_profile_table_v9")
 
 with tabs[3]:
     st.subheader("Report tag extraction audit")
