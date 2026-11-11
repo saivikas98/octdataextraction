@@ -611,6 +611,35 @@ def make_step_elapsed_profile(wide_df, selected_steps):
         parts.append(g)
     return pd.concat(parts, ignore_index=True, sort=False) if parts else pd.DataFrame()
 
+def show_plot_with_downloads(fig, chart_key, file_stem, height=None):
+    """Display a Plotly chart and provide HTML and high-resolution PNG downloads."""
+    if height:
+        fig.update_layout(height=height)
+    st.plotly_chart(fig, use_container_width=True, key=chart_key)
+    safe_name=re.sub(r"[^A-Za-z0-9_-]+", "_", str(file_stem)).strip("_") or "plot"
+    html_bytes=fig.to_html(full_html=True, include_plotlyjs=True).encode("utf-8")
+    left,right=st.columns(2)
+    left.download_button(
+        "Download interactive HTML",
+        data=html_bytes,
+        file_name=f"{safe_name}.html",
+        mime="text/html",
+        key=f"download_html_{chart_key}",
+        use_container_width=True,
+    )
+    try:
+        png_bytes=fig.to_image(format="png", width=1800, height=1000, scale=2)
+        right.download_button(
+            "Download high-resolution PNG",
+            data=png_bytes,
+            file_name=f"{safe_name}.png",
+            mime="image/png",
+            key=f"download_png_{chart_key}",
+            use_container_width=True,
+        )
+    except Exception as exc:
+        right.info("PNG export unavailable. Ensure kaleido is installed; HTML download remains available.")
+
 def safe_table(df,height=650,max_rows=3000,key=None):
     df=df.copy()
     if isinstance(df.index,pd.MultiIndex):
@@ -819,7 +848,11 @@ with tabs[0]:
     unit=tag_df["Unit"].dropna().astype(str).replace("",pd.NA).dropna().iloc[0] if tag_df["Unit"].astype(str).str.len().gt(0).any() else ""
     plot_df=tag_df.iloc[::max(1,len(tag_df)//3000)]
     fig=px.line(plot_df,x="Date time",y="Value",title=f"{selected_tag} trend",labels={"Value":f"Value ({unit})" if unit else "Value"})
-    st.plotly_chart(fig,use_container_width=True)
+    show_plot_with_downloads(
+        fig,
+        chart_key=f"selected_tag_plot_{active_name}_{selected_tag}",
+        file_stem=f"{active_name}_{selected_tag}_trend",
+    )
     safe_table(tag_df[["Date time","Instrument tag","HMI equipment","HMI measurement name","Value","Unit","Step status","Source page"]],max_rows=max(3000,len(tag_df)),key="selected_tag_complete")
 with tabs[1]:
     safe_table(summary,height=600)
@@ -830,6 +863,20 @@ with tabs[2]:
     if cross_wide.empty:
         st.info("Process at least one ADAM Process report to create profiles.")
     else:
+        # Batch selector controls every cross-batch profile chart and its table.
+        available_batches = sorted(x for x in cross_wide["Batch"].dropna().astype(str).unique() if x.strip())
+        selected_batches = st.multiselect(
+            "Batch numbers",
+            available_batches,
+            default=available_batches,
+            key="profile_batches",
+            help="Select one batch for an individual profile or multiple batches for comparison."
+        )
+        if not selected_batches:
+            st.info("Select at least one batch number.")
+            st.stop()
+        cross_wide = cross_wide[cross_wide["Batch"].astype(str).isin(selected_batches)].copy()
+
         profile_steps = sorted(x for x in cross_wide["Step status"].dropna().astype(str).unique() if x.strip())
         requested_defaults = [
             "TRANSFER FROM MV01 TO MV04", "MV03 DEPRESSURISE",
@@ -847,8 +894,12 @@ with tabs[2]:
         else:
             profile = make_step_elapsed_profile(cross_wide, selected_steps)
             if profile.empty:
-                st.info("No records match the selected steps.")
+                st.info("No records match the selected batches and steps.")
             else:
+                m1,m2,m3=st.columns(3)
+                m1.metric("Selected batches",len(selected_batches))
+                m2.metric("Selected steps",len(selected_steps))
+                m3.metric("Profile rows",f"{len(profile):,}")
                 x_col = "Elapsed time (min)" if x_mode.startswith("Elapsed") else "Date time"
                 plot_profile = profile.iloc[::max(1, len(profile)//12000)].copy()
                 titles = {
@@ -865,7 +916,12 @@ with tabs[2]:
                     fig = px.line(chart, x=x_col, y=tag, color="Profile label", line_group="Profile label",
                                   markers=True, title=titles.get(tag, tag), hover_data=["Batch", "Step status"])
                     fig.update_layout(height=430, legend_title_text="Batch | Step | Run")
-                    st.plotly_chart(fig, use_container_width=True, key=f"profile_{tag}_{x_mode}")
+                    show_plot_with_downloads(
+                        fig,
+                        chart_key=f"profile_{tag}_{x_mode}",
+                        file_stem=f"cross_batch_{'_'.join(selected_batches)}_{tag}_{x_mode}",
+                        height=430,
+                    )
                 # Sort while Step occurrence still exists, then select visible columns.
                 columns = ["Source report", "Batch", "Date time", "Elapsed time (min)", "Step status"] + selected_tags
                 sorted_profile = profile.sort_values(["Source report", "Step occurrence", "Date time"], kind="stable")
@@ -902,7 +958,11 @@ with tabs[4]:
         else:
             plot=measurable.iloc[::max(1,len(measurable)//3000)]
             fig=px.line(plot,x="Date time",y="Flowrate (kg/min)",color="Transfer direction",markers=True,title=f"Interval flowrate: {flow_tag} | {flow_step}")
-            st.plotly_chart(fig,use_container_width=True)
+            show_plot_with_downloads(
+                fig,
+                chart_key=f"interval_flow_plot_{active_name}_{flow_tag}_{flow_step}",
+                file_stem=f"interval_flow_{active_name}_{flow_tag}_{flow_step}",
+            )
             cols=["Previous time","Date time","Instrument tag","Vessel","Destination / route","Previous weight (kg)","Smoothed weight (kg)","Weight change (kg)","Interval (min)","Signed flow (kg/min)","Flowrate (kg/min)","Flowrate (kg/h)","Transfer direction","Step status","Source page"]
             safe_table(measurable[cols],height=650,max_rows=max(3000,len(measurable)),key=f"interval_flow_{active_name}_{flow_tag}_{flow_step}")
 
