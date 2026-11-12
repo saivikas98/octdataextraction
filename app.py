@@ -947,11 +947,11 @@ def build_multi_sensor_profile(profile, tags, title=None, y_ranges=None, highlig
 
     def sensor_family(tag):
         upper=str(tag).upper()
-        if upper.startswith("LSICR"):
+        if upper.startswith("LSICR") or "WICR" in upper:
             return "Weight (kg)"
-        if upper.startswith(("TICR","TT-")):
+        if upper.startswith(("TICR","TT-")) or re.search(r"(?:^|\d)TT-?0?1$", upper):
             return "Temperature (°C)"
-        if upper.startswith(("PICR","PT-")):
+        if upper.startswith(("PICR","PT-")) or re.search(r"(?:^|\d)PT-?0?1$", upper):
             return "Pressure (bar)"
         return "Value"
 
@@ -1092,9 +1092,9 @@ def build_cross_batch_sensor_profile(profile, tags, title, y_ranges=None, highli
 
     def sensor_family(tag):
         upper=str(tag).upper()
-        if upper.startswith("LSICR"): return "Weight (kg)"
-        if upper.startswith(("TICR","TT-")): return "Temperature (°C)"
-        if upper.startswith(("PICR","PT-")): return "Pressure (bar)"
+        if upper.startswith("LSICR") or "WICR" in upper: return "Weight (kg)"
+        if upper.startswith(("TICR","TT-")) or re.search(r"(?:^|\d)TT-?0?1$", upper): return "Temperature (°C)"
+        if upper.startswith(("PICR","PT-")) or re.search(r"(?:^|\d)PT-?0?1$", upper): return "Pressure (bar)"
         return "Value"
 
     families=[]
@@ -1164,11 +1164,11 @@ def build_single_sensor_profile(profile, tag, title=None, y_range=None, highligh
         return go.Figure()
 
     upper=str(tag).upper()
-    if upper.startswith("LSICR"):
+    if upper.startswith("LSICR") or "WICR" in upper:
         unit="kg"; y_title=f"{tag} weight (kg)"
-    elif upper.startswith(("TICR","TT-")):
+    elif upper.startswith(("TICR","TT-")) or re.search(r"(?:^|\d)TT-?0?1$", upper):
         unit="°C"; y_title=f"{tag} temperature (°C)"
-    elif upper.startswith(("PICR","PT-")):
+    elif upper.startswith(("PICR","PT-")) or re.search(r"(?:^|\d)PT-?0?1$", upper):
         unit="bar"; y_title=f"{tag} pressure (bar)"
     else:
         unit=""; y_title=tag
@@ -1347,7 +1347,7 @@ def safe_table(df,height=650,max_rows=3000,key=None):
     st.dataframe(view,width="stretch",hide_index=True,height=height,row_height=31,key=key)
 
 st.title("Universal ADAM and OMCA ANFDA Multi-Report Extractor")
-st.caption("Build: INTERACTIVE-MULTI-SENSOR-v26 | CV4/CV5 tags added to sensor dropdown")
+st.caption("Build: INTERACTIVE-MULTI-SENSOR-v27 | Legacy CV4/CV5 sensor selection fixed")
 st.caption("Fast extraction uses Poppler pdftotext, then applies the selected ADAM or OMCA parser. Multiple reports are supported without automatic detection delay.")
 uploads=st.sidebar.file_uploader(
     "Upload multiple report PDFs",
@@ -1696,10 +1696,22 @@ with tabs[2]:
         )
         effective_highlight_step=highlight_step if highlight_enabled else None
 
+        # Classify sensors from the complete selected sequence. Legacy CV4/CV5
+        # tags do not begin with TICR/PICR/LSICR, so explicitly recognize
+        # CV4TT/CV5TT, CV4PT/CV5PT, and CV4WICR/CV5WICR.
         columns=[str(c) for c in chronological.columns]
-        temperature_tags=sorted(c for c in columns if c.upper().startswith(("TICR","TT-")))
-        pressure_tags=sorted(c for c in columns if c.upper().startswith(("PICR","PT-")))
-        loadcell_tags=sorted(c for c in columns if c.upper().startswith("LSICR"))
+        def profile_sensor_family(tag):
+            upper=str(tag).upper().strip()
+            if upper.startswith("LSICR") or "WICR" in upper:
+                return "loadcell"
+            if upper.startswith(("TICR","TT-")) or re.search(r"^CV[45]TT-0?1$",upper):
+                return "temperature"
+            if upper.startswith(("PICR","PT-")) or re.search(r"^CV[45]PT-0?1$",upper):
+                return "pressure"
+            return "other"
+        temperature_tags=sorted(c for c in columns if profile_sensor_family(c)=="temperature")
+        pressure_tags=sorted(c for c in columns if profile_sensor_family(c)=="pressure")
+        loadcell_tags=sorted(c for c in columns if profile_sensor_family(c)=="loadcell")
         c1,c2,c3=st.columns(3)
         with c1:
             selected_temp=st.multiselect("Temperature sensors",temperature_tags,default=[x for x in ["TICR008"] if x in temperature_tags],key="multi_batch_temp_v9")
