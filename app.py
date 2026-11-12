@@ -571,6 +571,34 @@ def extract_pdf_pages_ocr(raw: bytes, first_page=1, last_page=None):
         page_progress.empty(); status_box.empty()
     return pages,"Low-CPU Poppler 150 DPI + single-pass Tesseract",time.perf_counter()-started
 
+LEGACY_STEP_NAME_MAP = {
+    "TRANSFER FROM CV-05 TO ANFD": "TRANSFER FROM CV-05 TO ANFD",
+    "CV-04 ADD API SOLUTION TO CV-03": "CV-04 ADD API SOLUTION TO CV-03",
+    "CV-04 AGITATION": "CV-04 AGITATION",
+    "CV-04 API DISPERSION": "CV-04 API DISPERSION",
+    "CV-04 CHARGE PLGA USING N2": "CV-04 CHARGE PLGA USING N2",
+    "CV-04 CHECKS": "CV-04 CHECKS",
+    "CV-04 PRESSURIZATION": "CV-04 PRESSURIZATION",
+    "CV-04 TRANSFER API SOLUTION TO CV-04": "CV-04 TRANSFER API SOLUTION TO CV-04",
+    "CV-05 TC & N2 BLANKETING HOLD TIME": "CV-05 TC & N2 BLANKETING HOLD TIME",
+    "CYCLE HOLD": "CYCLE HOLD", "HOLD TIME": "HOLD TIME",
+    "TRANSFER COACEVRATES CV-04 TO CV-05": "TRANSFER COACEVRATES CV-04 to CV-05",
+    "TRANSFER DIMETHICON FROM FROM FV-01 TO CV-04": "TRANSFER DIMETHICON FROM FROM FV-01 TO CV-04",
+    "TRANSFER FROM V-01 TO CV-05": "TRANSFER FROM V-01 TO CV-05",
+    "TRANSFER FROM V-02 TO CV-05": "TRANSFER FROM V-02 TO CV-05",
+    "V-01 CHARGE HEPTANE": "V-01 CHARGE HEPTANE",
+    "V-01 RECIRCULATION": "V-01 RECIRCULATION",
+}
+def correct_legacy_step_name(value):
+    raw=clean_text(value)
+    if not raw: return raw
+    cleaned=re.sub(r"\s+"," ",raw.strip(" ‘'`|.,"))
+    upper=cleaned.upper()
+    upper=re.sub(r"\bAP(?:!|\||1)\s+SOLUTION\b","API SOLUTION",upper)
+    upper=re.sub(r"\bANED\b","ANFD",upper)
+    upper=re.sub(r"\s+AAA$","",upper).strip(" |.,")
+    return LEGACY_STEP_NAME_MAP.get(upper,cleaned.strip(" |.,"))
+
 def parse_legacy_cv_report(pages, source_page_offset=0):
     """Parse scanned CV4/CV5 process tables while preserving every source-column position."""
     target={"CV4WICR-01","CV4TT-01","CV4PT-01","CV5WICR-01","CV5TT-01","CV5PT-01"}
@@ -620,7 +648,7 @@ def parse_legacy_cv_report(pages, source_page_offset=0):
             if not all(NUMBER_RE.fullmatch(x) for x in numeric): continue
             dt=pd.to_datetime(m.group(1)+" "+m.group(2),dayfirst=True,errors="coerce")
             if pd.isna(dt): continue
-            status=clean_text(" ".join(tokens[len(tags):])) or "STATUS NOT CAPTURED"
+            status=correct_legacy_step_name(" ".join(tokens[len(tags):])) or "STATUS NOT CAPTURED"
             # Reject a corrupted status that still starts with a numeric sensor value.
             while status and re.match(r"^-?\d+(?:\.\d+)?(?:\s|$)",status):
                 status=re.sub(r"^-?\d+(?:\.\d+)?\s*","",status,1).strip()
@@ -764,8 +792,11 @@ def identify_process_sequences(data, start_step, end_step, max_duration_minutes=
     d["_run"]=new_run.cumsum()
     runs=(d.groupby("_run",as_index=False)
           .agg(Status=("Step status","first"),Start=("Date time","min"),End=("Date time","max"),Rows=("Date time","size")))
-    starts=runs[runs["Status"].astype(str)==str(start_step)]
-    ends=runs[runs["Status"].astype(str)==str(end_step)]
+    start_norm=normalize_step_name(start_step)
+    end_norm=normalize_step_name(end_step)
+    runs["_Status norm"]=runs["Status"].astype(str).map(normalize_step_name)
+    starts=runs[runs["_Status norm"]==start_norm]
+    ends=runs[runs["_Status norm"]==end_norm]
     sequences=[]
     for _,sr in starts.iterrows():
         possible=ends[(ends["Start"]>=sr["Start"]) &
@@ -1316,7 +1347,7 @@ def safe_table(df,height=650,max_rows=3000,key=None):
     st.dataframe(view,width="stretch",hide_index=True,height=height,row_height=31,key=key)
 
 st.title("Universal ADAM and OMCA ANFDA Multi-Report Extractor")
-st.caption("Build: INTERACTIVE-MULTI-SENSOR-v22 | Low-CPU single-pass CV OCR")
+st.caption("Build: INTERACTIVE-MULTI-SENSOR-v25 | Flexible sequence matching and 24-hour default")
 st.caption("Fast extraction uses Poppler pdftotext, then applies the selected ADAM or OMCA parser. Multiple reports are supported without automatic detection delay.")
 uploads=st.sidebar.file_uploader(
     "Upload multiple report PDFs",
@@ -1358,7 +1389,7 @@ for idx,uploaded in enumerate(uploads):
 legacy_first_page=st.sidebar.number_input("Legacy OCR start page",min_value=1,value=1,step=1,help="Used only for Legacy CV4/CV5 Process Report.")
 legacy_last_page=st.sidebar.number_input("Legacy OCR end page",min_value=1,value=42,step=1,help="Use the internal PDF page numbers, for example 196-237 or 275-316.")
 @st.cache_data(show_spinner=False, max_entries=2, ttl=1800)
-def process_uploaded_report(file_name, raw, selected_type, first_page=1, last_page=None, parser_version="legacy-cv-v4-low-cpu"):
+def process_uploaded_report(file_name, raw, selected_type, first_page=1, last_page=None, parser_version="legacy-cv-v6-low-cpu-step-correction"):
     if selected_type=="Legacy CV4/CV5 Process Report (OCR)":
         pages,extraction_engine,text_extraction_seconds=extract_pdf_pages_ocr(raw,first_page,last_page)
     else:
@@ -1414,7 +1445,7 @@ if process_now:
         selected_type=report_type_by_file[uploaded.name]
         progress.progress(i/len(uploads),text=f"Extracting {uploaded.name} as {selected_type} ({i+1} of {len(uploads)})")
         try:
-            reports.append(process_uploaded_report(uploaded.name,uploaded.getvalue(),selected_type,int(legacy_first_page),int(legacy_last_page),"legacy-cv-v4-low-cpu"))
+            reports.append(process_uploaded_report(uploaded.name,uploaded.getvalue(),selected_type,int(legacy_first_page),int(legacy_last_page),"legacy-cv-v6-low-cpu-step-correction"))
         except Exception as exc:
             reports.append({"file_name":uploaded.name,"detected_type":"Failed","error":f"{type(exc).__name__}: {exc}","long_df":pd.DataFrame(),"events":pd.DataFrame(),"alarms":pd.DataFrame(),"groups":{},"meta":{"File name":uploaded.name},"adam_score":0,"omca_score":0})
         gc.collect()
@@ -1570,14 +1601,25 @@ with tabs[2]:
         with c_end:
             end_step=st.selectbox("Sequence end step",all_steps,index=all_steps.index(preferred_end) if preferred_end in all_steps else max(0,len(all_steps)-1),key="multi_batch_end_v9")
         with c_duration:
-            max_duration=st.number_input("Max duration (min)",10,1440,180,10,key="multi_batch_duration_v9")
+            max_duration=st.number_input("Max duration (min)",10,2880,1440,10,key="multi_batch_duration_v10",
+                help="Maximum allowed time from the beginning of the selected start step to the end of the selected end step. Use 1440 for a 24-hour process.")
 
         sequence_parts=[]; sequence_rows=[]
         for batch_name in selected_batches:
             batch_data=selected_data[selected_data["Batch"].astype(str)==str(batch_name)].sort_values("Date time").copy()
             matches=identify_process_sequences(batch_data,start_step,end_step,max_duration)
             if not matches:
-                sequence_rows.append({"Batch":batch_name,"Status":"No matching sequence"})
+                start_times=batch_data.loc[batch_data["Step status"].astype(str).map(normalize_step_name)==normalize_step_name(start_step),"Date time"]
+                end_times=batch_data.loc[batch_data["Step status"].astype(str).map(normalize_step_name)==normalize_step_name(end_step),"Date time"]
+                detail="Start or end step is absent"
+                if not start_times.empty and not end_times.empty:
+                    later_ends=end_times[end_times>=start_times.min()]
+                    if later_ends.empty:
+                        detail="The selected end step occurs before the selected start step"
+                    else:
+                        required=(later_ends.min()-start_times.min()).total_seconds()/60
+                        detail=f"Required duration is approximately {required:.0f} min; selected limit is {max_duration} min"
+                sequence_rows.append({"Batch":batch_name,"Status":"No matching sequence","Reason":detail})
                 continue
             best=max(matches,key=lambda x:(x.get("gain",0),-x.get("duration",999999)))
             part=best["data"].copy().sort_values("Date time")
