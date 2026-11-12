@@ -528,36 +528,12 @@ def parse_process_report(pages):
         long_df["Step status"]=long_df["Step status"].fillna("").astype(str).str.strip()
     return wide,long_df,pd.DataFrame(events),pd.DataFrame(alarms)
 
-def repair_legacy_ocr_missing_decimals(long_df):
-    """Repair strong missing-decimal OCR anomalies using adjacent sensor readings."""
-    if long_df is None or long_df.empty: return long_df
-    out=long_df.copy().sort_values(["Instrument tag","Date time"])
-    out["OCR original value"]=pd.to_numeric(out["Value"],errors="coerce")
-    out["OCR decimal repaired"]=False
-    for tag,idx in out.groupby("Instrument tag",sort=False).groups.items():
-        upper=str(tag).upper()
-        if "WICR" in upper or upper.startswith("LSICR"): continue
-        values=pd.to_numeric(out.loc[idx,"Value"],errors="coerce")
-        local=values.rolling(7,center=True,min_periods=2).median()
-        for row_i,current,reference in zip(idx,values,local):
-            if pd.isna(current) or pd.isna(reference) or abs(reference)<1e-9: continue
-            candidates=[current/10.0,current/100.0,current/1000.0]
-            best=min(candidates,key=lambda x:abs(x-reference))
-            if (abs(current)>=10*max(abs(reference),1.0)
-                and abs(best-reference)<=0.20*max(abs(reference),1.0)
-                and abs(best-reference)<0.10*abs(current-reference)):
-                out.at[row_i,"Value"]=best
-                out.at[row_i,"OCR decimal repaired"]=True
-    return out.sort_index()
-
 def extract_pdf_pages_ocr(raw: bytes, first_page=1, last_page=None):
     """Low-CPU, single-pass, page-at-a-time OCR for scanned legacy reports."""
     started=time.perf_counter()
     if not shutil.which("pdftoppm") or not shutil.which("tesseract"):
         raise RuntimeError("Legacy OCR requires poppler-utils and tesseract-ocr in packages.txt.")
     first_page=max(1,int(first_page)); last_page=max(first_page,int(last_page or first_page))
-    if last_page-first_page+1>50:
-        raise ValueError("Process a maximum of 50 OCR pages per run on Streamlit Community Cloud.")
     env=os.environ.copy()
     env.update({"OMP_THREAD_LIMIT":"1","OMP_NUM_THREADS":"1","OPENBLAS_NUM_THREADS":"1","MKL_NUM_THREADS":"1","NUMEXPR_NUM_THREADS":"1"})
     pages=[]
@@ -1369,7 +1345,7 @@ def safe_table(df,height=650,max_rows=3000,key=None):
     st.dataframe(view,width="stretch",hide_index=True,height=height,row_height=31,key=key)
 
 st.title("Universal ADAM and OMCA ANFDA Multi-Report Extractor")
-st.caption("Build: INTERACTIVE-MULTI-SENSOR-v28 | Sensor selection and OCR decimal repair fixed")
+st.caption("Build: INTERACTIVE-MULTI-SENSOR-v30 | Per-PDF OCR page ranges")
 st.caption("Fast extraction uses Poppler pdftotext, then applies the selected ADAM or OMCA parser. Multiple reports are supported without automatic detection delay.")
 uploads=st.sidebar.file_uploader(
     "Upload multiple report PDFs",
@@ -1408,8 +1384,27 @@ for idx,uploaded in enumerate(uploads):
         help="ADAM: Process Cycle reports with full date/time and multiple LSICR/PICR/TICR groups. OMCA ANFDA: ANFD-2 Drying reports with Record, Time, TT-01, TT-02, PT-01, Filter_Pos, Agit_Rpm and Agit_Pos."
     )
 
-legacy_first_page=st.sidebar.number_input("Legacy OCR start page",min_value=1,value=1,step=1,help="Used only for Legacy CV4/CV5 Process Report.")
-legacy_last_page=st.sidebar.number_input("Legacy OCR end page",min_value=1,value=42,step=1,help="Use the internal PDF page numbers, for example 196-237 or 275-316.")
+st.sidebar.subheader("Legacy OCR page range for each PDF")
+legacy_page_range_by_file={}
+for idx,uploaded in enumerate(uploads):
+    if report_type_by_file.get(uploaded.name)=="Legacy CV4/CV5 Process Report (OCR)":
+        st.sidebar.markdown(f"**{uploaded.name}**")
+        page_col1,page_col2=st.sidebar.columns(2)
+        with page_col1:
+            first_page=st.number_input(
+                "Start page",min_value=1,value=1,step=1,
+                key=f"legacy_start_{idx}_{uploaded.name}_{uploaded.size}",
+                help="Internal PDF start page for this report."
+            )
+        with page_col2:
+            last_page=st.number_input(
+                "End page",min_value=1,value=42,step=1,
+                key=f"legacy_end_{idx}_{uploaded.name}_{uploaded.size}",
+                help="Internal PDF end page for this report."
+            )
+        legacy_page_range_by_file[uploaded.name]=(int(first_page),int(last_page))
+    else:
+        legacy_page_range_by_file[uploaded.name]=(1,None)
 @st.cache_data(show_spinner=False, max_entries=2, ttl=1800)
 def process_uploaded_report(file_name, raw, selected_type, first_page=1, last_page=None, parser_version="legacy-cv-v6-low-cpu-step-correction"):
     if selected_type=="Legacy CV4/CV5 Process Report (OCR)":
@@ -1428,7 +1423,6 @@ def process_uploaded_report(file_name, raw, selected_type, first_page=1, last_pa
         groups,long_df,events,alarms=parse_omca_anfd_report(pages)
     elif selected_type=="Legacy CV4/CV5 Process Report (OCR)":
         groups,long_df,events,alarms,tag_inventory=parse_legacy_cv_report(pages,int(first_page)-1)
-        long_df=repair_legacy_ocr_missing_decimals(long_df)
     else:
         error="Select a valid report type."
     if error is None and long_df.empty:
@@ -1468,7 +1462,10 @@ if process_now:
         selected_type=report_type_by_file[uploaded.name]
         progress.progress(i/len(uploads),text=f"Extracting {uploaded.name} as {selected_type} ({i+1} of {len(uploads)})")
         try:
-            reports.append(process_uploaded_report(uploaded.name,uploaded.getvalue(),selected_type,int(legacy_first_page),int(legacy_last_page),"legacy-cv-v6-low-cpu-step-correction"))
+            first_page,last_page=legacy_page_range_by_file.get(uploaded.name,(1,None))
+            if selected_type=="Legacy CV4/CV5 Process Report (OCR)" and last_page is not None and last_page<first_page:
+                raise ValueError(f"End page ({last_page}) must be greater than or equal to start page ({first_page}) for {uploaded.name}.")
+            reports.append(process_uploaded_report(uploaded.name,uploaded.getvalue(),selected_type,first_page,last_page,"legacy-cv-v7-per-file-page-range"))
         except Exception as exc:
             reports.append({"file_name":uploaded.name,"detected_type":"Failed","error":f"{type(exc).__name__}: {exc}","long_df":pd.DataFrame(),"events":pd.DataFrame(),"alarms":pd.DataFrame(),"groups":{},"meta":{"File name":uploaded.name},"adam_score":0,"omca_score":0})
         gc.collect()
@@ -1720,15 +1717,9 @@ with tabs[2]:
         effective_highlight_step=highlight_step if highlight_enabled else None
 
         columns=[str(c) for c in chronological.columns]
-        def profile_sensor_family(tag):
-            upper=str(tag).upper().strip()
-            if upper.startswith("LSICR") or "WICR" in upper: return "loadcell"
-            if upper.startswith(("TICR","TT-")) or re.search(r"^CV[45]TT-0?1$",upper): return "temperature"
-            if upper.startswith(("PICR","PT-")) or re.search(r"^CV[45]PT-0?1$",upper): return "pressure"
-            return "other"
-        temperature_tags=sorted(c for c in columns if profile_sensor_family(c)=="temperature")
-        pressure_tags=sorted(c for c in columns if profile_sensor_family(c)=="pressure")
-        loadcell_tags=sorted(c for c in columns if profile_sensor_family(c)=="loadcell")
+        temperature_tags=sorted(c for c in columns if c.upper().startswith(("TICR","TT-")))
+        pressure_tags=sorted(c for c in columns if c.upper().startswith(("PICR","PT-")))
+        loadcell_tags=sorted(c for c in columns if c.upper().startswith("LSICR"))
         c1,c2,c3=st.columns(3)
         with c1:
             selected_temp=st.multiselect("Temperature sensors",temperature_tags,default=[x for x in ["TICR008"] if x in temperature_tags],key="multi_batch_temp_v9")
