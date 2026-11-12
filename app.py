@@ -1347,7 +1347,7 @@ def safe_table(df,height=650,max_rows=3000,key=None):
     st.dataframe(view,width="stretch",hide_index=True,height=height,row_height=31,key=key)
 
 st.title("Universal ADAM and OMCA ANFDA Multi-Report Extractor")
-st.caption("Build: INTERACTIVE-MULTI-SENSOR-v25 | Flexible sequence matching and 24-hour default")
+st.caption("Build: INTERACTIVE-MULTI-SENSOR-v26 | CV4/CV5 tags added to sensor dropdown")
 st.caption("Fast extraction uses Poppler pdftotext, then applies the selected ADAM or OMCA parser. Multiple reports are supported without automatic detection delay.")
 uploads=st.sidebar.file_uploader(
     "Upload multiple report PDFs",
@@ -1525,11 +1525,22 @@ q2.metric("Unique step statuses",long_df["Step status"].nunique())
 q3.metric("Numeric-prefix status rows",status_numeric_prefix)
 if status_numeric_prefix:
     st.warning("Some status rows still start with numeric values. Clear the application cache and process the report again with this corrected parser.")
-tag_options=long_df[["Instrument tag","HMI display label"]].drop_duplicates().sort_values("Instrument tag")
-tags=tag_options["Instrument tag"].tolist()
+# Keep the six legacy CV tags visible in the sensor selector, even when the active page range contains only CV4 or CV5.
+LEGACY_CV_SELECTOR_TAGS=["CV4WICR-01","CV4TT-01","CV4PT-01","CV5WICR-01","CV5TT-01","CV5PT-01"]
+present_options=long_df[["Instrument tag","HMI display label"]].drop_duplicates()
+selector_rows=[]
+for selector_tag in LEGACY_CV_SELECTOR_TAGS:
+    equipment,measurement,unit=HMI_TAG_MAP.get(selector_tag,("","",""))
+    selector_rows.append({"Instrument tag":selector_tag,"HMI display label":f"{selector_tag} | {equipment} | {measurement}"})
+master_options=pd.DataFrame(selector_rows)
+tag_options=pd.concat([present_options,master_options],ignore_index=True).drop_duplicates("Instrument tag",keep="first").sort_values("Instrument tag")
+tags=present_options["Instrument tag"].drop_duplicates().sort_values().tolist()
 selected_label=st.sidebar.selectbox("Instrument tag / HMI name",tag_options["HMI display label"].tolist(),key=f"tag_select_{active_name}")
 selected_tag=tag_options.loc[tag_options["HMI display label"]==selected_label,"Instrument tag"].iloc[0]
+tag_available=selected_tag in set(long_df["Instrument tag"].astype(str))
 tag_df=long_df[long_df["Instrument tag"]==selected_tag].sort_values("Date time")
+if not tag_available:
+    st.sidebar.warning(f"{selected_tag} is available in the sensor list but has no extracted readings in the active PDF page range.")
 statuses=sorted(x for x in tag_df["Step status"].dropna().astype(str).unique() if x.strip())
 chosen=st.sidebar.multiselect(
     "Optional step-status filter",
@@ -1558,8 +1569,11 @@ else:
 
 tabs=st.tabs(["Selected tag","Tag summary", "Cross-batch profiles","Extraction audit","Transfer flowrate","HMI tag dictionary","Instrument groups","All tagwise data","Events & alarms","Metadata"])
 with tabs[0]:
-    selected_equipment=tag_df["HMI equipment"].iloc[0] if not tag_df.empty else ""
-    selected_measurement=tag_df["HMI measurement name"].iloc[0] if not tag_df.empty else ""
+    if tag_df.empty:
+        equipment,measurement,unit_hint=HMI_TAG_MAP.get(selected_tag,("","",""))
+        st.info(f"{selected_tag} is included in the sensor dropdown, but no readings were extracted for this tag from the active page range. Select the corresponding CV4 or CV5 page range and reprocess the PDF.")
+    selected_equipment=tag_df["HMI equipment"].iloc[0] if not tag_df.empty else HMI_TAG_MAP.get(selected_tag,("","",""))[0]
+    selected_measurement=tag_df["HMI measurement name"].iloc[0] if not tag_df.empty else HMI_TAG_MAP.get(selected_tag,("","",""))[1]
     st.subheader(f"{selected_tag}: {selected_measurement}")
     st.caption(f"HMI equipment: {selected_equipment}")
     unit=tag_df["Unit"].dropna().astype(str).replace("",pd.NA).dropna().iloc[0] if tag_df["Unit"].astype(str).str.len().gt(0).any() else ""
