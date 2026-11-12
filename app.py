@@ -531,8 +531,10 @@ def extract_pdf_pages_ocr(raw: bytes, first_page=1, last_page=None):
     with tempfile.TemporaryDirectory() as tmp:
         pdf_path=os.path.join(tmp,"input.pdf")
         with open(pdf_path,"wb") as f: f.write(raw)
-        cmd=["pdftoppm","-f",str(max(1,int(first_page))),"-r","200","-png",pdf_path,os.path.join(tmp,"page")]
-        if last_page: cmd[2:2]=["-l",str(max(int(first_page),int(last_page)))]
+        cmd=["pdftoppm","-f",str(max(1,int(first_page)))]
+        if last_page:
+            cmd.extend(["-l",str(max(int(first_page),int(last_page)))])
+        cmd.extend(["-r","200","-png",pdf_path,os.path.join(tmp,"page")])
         subprocess.run(cmd,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,timeout=600,check=True)
         images=sorted(Path(tmp).glob("page-*.png"))
         pages=[]
@@ -1303,7 +1305,7 @@ for idx,uploaded in enumerate(uploads):
     )
 
 legacy_first_page=st.sidebar.number_input("Legacy OCR start page",min_value=1,value=1,step=1,help="Used only for Legacy CV4/CV5 Process Report.")
-legacy_last_page=st.sidebar.number_input("Legacy OCR end page",min_value=1,value=316,step=1,help="Use the internal PDF page numbers, for example 196-237 or 275-316.")
+legacy_last_page=st.sidebar.number_input("Legacy OCR end page",min_value=1,value=42,step=1,help="Use the internal PDF page numbers, for example 196-237 or 275-316.")
 @st.cache_data(show_spinner=False, max_entries=2, ttl=1800)
 def process_uploaded_report(file_name, raw, selected_type, first_page=1, last_page=None, parser_version="legacy-cv-v1"):
     if selected_type=="Legacy CV4/CV5 Process Report (OCR)":
@@ -1324,6 +1326,9 @@ def process_uploaded_report(file_name, raw, selected_type, first_page=1, last_pa
         groups,long_df,events,alarms,tag_inventory=parse_legacy_cv_report(pages,int(first_page)-1)
     else:
         error="Select a valid report type."
+    if error is None and long_df.empty:
+        error=("No requested CV4/CV5 data rows were parsed. Confirm the Legacy report type, page range, "
+               "and that packages.txt contains poppler-utils, tesseract-ocr, and imagemagick.")
     meta["File name"]=file_name
     meta["Selected report type"]=selected_type
     meta["Text extraction engine"]=extraction_engine
@@ -1360,7 +1365,7 @@ if process_now:
         try:
             reports.append(process_uploaded_report(uploaded.name,uploaded.getvalue(),selected_type,int(legacy_first_page),int(legacy_last_page),"legacy-cv-v1"))
         except Exception as exc:
-            reports.append({"file_name":uploaded.name,"detected_type":"Failed","error":str(exc),"long_df":pd.DataFrame(),"events":pd.DataFrame(),"alarms":pd.DataFrame(),"groups":{},"meta":{"File name":uploaded.name},"adam_score":0,"omca_score":0})
+            reports.append({"file_name":uploaded.name,"detected_type":"Failed","error":f"{type(exc).__name__}: {exc}","long_df":pd.DataFrame(),"events":pd.DataFrame(),"alarms":pd.DataFrame(),"groups":{},"meta":{"File name":uploaded.name},"adam_score":0,"omca_score":0})
         gc.collect()
     progress.progress(1.0,text=f"Processed {len(uploads)} report(s)")
     st.session_state["processed_reports"]=reports
