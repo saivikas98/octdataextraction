@@ -551,45 +551,71 @@ def extract_pdf_pages_ocr(raw: bytes, first_page=1, last_page=None):
         return pages,"Poppler + Tesseract OCR",time.perf_counter()-started
 
 def parse_legacy_cv_report(pages, source_page_offset=0):
-    """Parse CV4/CV5 landscape PROCESS REPORT tables and retain only requested tags."""
+    """Parse scanned CV4/CV5 process tables while preserving every source-column position."""
     target={"CV4WICR-01","CV4TT-01","CV4PT-01","CV5WICR-01","CV5TT-01","CV5PT-01"}
+    unit_map={"WICR":"Kg","TT":"°C","PT":"bar","AG":"rpm"}
     long_rows=[]; groups={}; inventory=[]
     row_re=re.compile(r"^(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2}:\d{2})\s+(.+)$")
+
+    def normalized_header(line):
+        x=line.upper().replace("|"," ").replace("["," ").replace("]"," ").replace("{"," ").replace("}"," ")
+        fixes={"CVSWICR":"CV5WICR","CVSTT":"CV5TT","CVSPT":"CV5PT","CVSAG":"CV5AG",
+               "CVATT":"CV4TT","CVAWICR":"CV4WICR","CVAPT":"CV4PT","CVAAG":"CV4AG",
+               "NCV3PT-O1":"NCV3PT-01","CV3TT-O1":"CV3TT-01"}
+        for a,b in fixes.items(): x=x.replace(a,b)
+        return x
+
     for local_page,text in enumerate(pages,1):
         source_page=source_page_offset+local_page
         lines=[" ".join(x.split()) for x in text.splitlines() if x.strip()]
-        tags=[]; locations=[]; parameters=[]; units=[]
+        tags=[]
         for line in lines:
             if line.upper().startswith("TAG "):
-                raw_tags=re.findall(r"CV[45](?:WICR|TT|PT|AG)-0?1",line.upper().replace("CVSWICR","CV5WICR").replace("CVSTT","CV5TT").replace("CVSPT","CV5PT").replace("CVATT","CV4TT"))
-                tags=[x[:-1]+"01" if x.endswith("-1") else x for x in raw_tags]
-            elif line.upper().startswith("LOCATION "): locations=line.split()[1:]
-            elif line.upper().startswith("PARAMETER "): parameters=line.split()[1:]
-            elif line.upper().startswith("UNIT "): units=line.split()[1:]
+                header=normalized_header(line)
+                tags=re.findall(r"N?CV[345](?:WICR|TT|PT|AG)-0?1",header)
+                tags=[re.sub(r"-0?1$","-01",x) for x in tags]
+                break
+        # Known five-column report layouts. These fallbacks preserve ignored columns so values do not leak into Cycle Step.
+        joined=" ".join(lines).upper()
+        if len(tags)<5:
+            if "CV4WICR" in joined or "CV4PT-01" in joined:
+                tags=["NCV3PT-01","CV3TT-01","CV4WICR-01","CV4TT-01","CV4PT-01"]
+            elif "CV5WICR" in joined or "CV5PT-01" in joined:
+                tags=["CV4AG-01","CV5WICR-01","CV5TT-01","CV5PT-01","CV5AG-01"]
         if not tags: continue
-        for i,tag in enumerate(tags):
-            if tag in target:
-                inventory.append({"Raw report tag":tag,"Canonical tag":tag,"Section":"Process Report","Header page":source_page})
-        group_name=" + ".join([t for t in tags if t in target])
-        wide=[]
+
+        selected=[t for t in tags if t in target]
+        if not selected: continue
+        for tag in selected:
+            inventory.append({"Raw report tag":tag,"Canonical tag":tag,"Section":"Process Report","Header page":source_page})
+        group_name=" + ".join(selected); wide=[]
         for raw in lines:
             m=row_re.match(raw)
             if not m: continue
             tokens=m.group(3).split()
-            if len(tokens)<len(tags) or not all(NUMBER_RE.match(x) for x in tokens[:len(tags)]): continue
+            if len(tokens)<len(tags): continue
+            numeric=tokens[:len(tags)]
+            if not all(NUMBER_RE.fullmatch(x) for x in numeric): continue
             dt=pd.to_datetime(m.group(1)+" "+m.group(2),dayfirst=True,errors="coerce")
             if pd.isna(dt): continue
             status=clean_text(" ".join(tokens[len(tags):])) or "STATUS NOT CAPTURED"
+            # Reject a corrupted status that still starts with a numeric sensor value.
+            while status and re.match(r"^-?\d+(?:\.\d+)?(?:\s|$)",status):
+                status=re.sub(r"^-?\d+(?:\.\d+)?\s*","",status,1).strip()
             wrow={"Date time":dt,"Status":status,"Source page":source_page}
-            for idx,(tag,value) in enumerate(zip(tags,tokens[:len(tags)])):
+            for idx,(tag,value) in enumerate(zip(tags,numeric)):
                 if tag not in target: continue
-                val=float(value); unit=units[idx] if idx<len(units) else HMI_TAG_MAP.get(tag,("","",""))[2]
+                val=float(value); kind=re.search(r"(WICR|TT|PT|AG)",tag)
+                unit=unit_map.get(kind.group(1),"") if kind else ""
                 wrow[tag]=val
-                long_rows.append({"Date time":dt,"Instrument tag":tag,"Value":val,"Unit":unit,"Step status":status,"Instrument group":group_name,"Source page":source_page})
-            if len(wrow)>3: wide.append(wrow)
+                long_rows.append({"Date time":dt,"Instrument tag":tag,"Value":val,"Unit":unit,
+                    "Step status":status,"Instrument group":group_name,"Source page":source_page})
+            if any(t in wrow for t in target): wide.append(wrow)
         if wide: groups[f"Page {source_page}: {group_name}"]=pd.DataFrame(wide)
+
     long_df=pd.DataFrame(long_rows)
-    if not long_df.empty: long_df=long_df.sort_values(["Date time","Instrument tag"]).drop_duplicates(["Date time","Instrument tag"],keep="first")
+    if not long_df.empty:
+        long_df=long_df.sort_values(["Date time","Instrument tag","Source page"]).drop_duplicates(["Date time","Instrument tag"],keep="first")
     inv=pd.DataFrame(inventory).drop_duplicates() if inventory else pd.DataFrame(columns=["Raw report tag","Canonical tag","Section","Header page"])
     return groups,long_df,pd.DataFrame(),pd.DataFrame(),inv
 
@@ -1268,7 +1294,7 @@ def safe_table(df,height=650,max_rows=3000,key=None):
     st.dataframe(view,width="stretch",hide_index=True,height=height,row_height=31,key=key)
 
 st.title("Universal ADAM and OMCA ANFDA Multi-Report Extractor")
-st.caption("Build: INTERACTIVE-MULTI-SENSOR-v19 | PDF filename batch labels in cross-batch plots")
+st.caption("Build: INTERACTIVE-MULTI-SENSOR-v20 | Correct CV column alignment and visible extracted tables")
 st.caption("Fast extraction uses Poppler pdftotext, then applies the selected ADAM or OMCA parser. Multiple reports are supported without automatic detection delay.")
 uploads=st.sidebar.file_uploader(
     "Upload multiple report PDFs",
