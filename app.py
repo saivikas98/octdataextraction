@@ -1345,7 +1345,7 @@ def safe_table(df,height=650,max_rows=3000,key=None):
     st.dataframe(view,width="stretch",hide_index=True,height=height,row_height=31,key=key)
 
 st.title("Universal ADAM and OMCA ANFDA Multi-Report Extractor")
-st.caption("Build: INTERACTIVE-MULTI-SENSOR-v30 | Per-PDF OCR page ranges")
+st.caption("Build: INTERACTIVE-MULTI-SENSOR-v31 | Per-PDF ranges and integrity check fixed")
 st.caption("Fast extraction uses Poppler pdftotext, then applies the selected ADAM or OMCA parser. Multiple reports are supported without automatic detection delay.")
 uploads=st.sidebar.file_uploader(
     "Upload multiple report PDFs",
@@ -1579,13 +1579,26 @@ m3.metric("Active report tags",len(tags)); m4.metric("Active tag readings",f"{le
 summary=(long_df.groupby(["Instrument tag","HMI equipment","HMI measurement name","Unit"],dropna=False,observed=True,as_index=False)
     .agg(Records=("Value","size"),Start=("Date time","min"),End=("Date time","max"),Minimum=("Value","min"),Maximum=("Value","max"),Mean=("Value","mean")))
 
-expected_tags={"CV4WICR-01","CV4TT-01","CV4PT-01"} if int(legacy_first_page)<=237 else {"CV5WICR-01","CV5TT-01","CV5PT-01"}
+# Validate only the CV sensor family applicable to the active report. Page
+# ranges are now stored per uploaded PDF, so the removed global
+# legacy_first_page variable must not be referenced here.
 found_tags=set(long_df.get("Instrument tag",pd.Series(dtype=str)).astype(str).unique())
+active_first_page,active_last_page=legacy_page_range_by_file.get(active_name,(1,None))
+cv4_expected={"CV4WICR-01","CV4TT-01","CV4PT-01"}
+cv5_expected={"CV5WICR-01","CV5TT-01","CV5PT-01"}
+if found_tags & cv4_expected:
+    expected_tags=cv4_expected
+elif found_tags & cv5_expected:
+    expected_tags=cv5_expected
+else:
+    expected_tags=set()
 missing_expected=sorted(expected_tags-found_tags)
 if missing_expected:
-    st.error("Extraction integrity check failed. Missing expected tags: "+", ".join(missing_expected)+". Clear cache and reprocess the PDF.")
+    st.error("Extraction integrity check failed for "+active_name+" (pages "+str(active_first_page)+"-"+str(active_last_page)+"). Missing expected tags: "+", ".join(missing_expected)+". Clear cache and reprocess this PDF.")
+elif expected_tags:
+    st.success(f"Extraction integrity check passed for {active_name}: {len(long_df):,} tag-wise rows across {len(found_tags)} extracted tags.")
 else:
-    st.success(f"Extraction integrity check passed: {len(long_df):,} tag-wise rows across {len(found_tags)} requested tags.")
+    st.info(f"No CV4/CV5 integrity-tag family was detected in {active_name}; the extracted data remains available for review.")
 
 tabs=st.tabs(["Selected tag","Tag summary", "Cross-batch profiles","Extraction audit","Transfer flowrate","HMI tag dictionary","Instrument groups","All tagwise data","Events & alarms","Metadata"])
 with tabs[0]:
