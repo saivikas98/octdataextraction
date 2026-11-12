@@ -577,11 +577,12 @@ def parse_legacy_cv_report(pages, source_page_offset=0):
                 break
         # Known five-column report layouts. These fallbacks preserve ignored columns so values do not leak into Cycle Step.
         joined=" ".join(lines).upper()
-        if len(tags)<5:
-            if "CV4WICR" in joined or "CV4PT-01" in joined:
-                tags=["NCV3PT-01","CV3TT-01","CV4WICR-01","CV4TT-01","CV4PT-01"]
-            elif "CV5WICR" in joined or "CV5PT-01" in joined:
-                tags=["CV4AG-01","CV5WICR-01","CV5TT-01","CV5PT-01","CV5AG-01"]
+        # These legacy reports have fixed five-value layouts. Never trust a partial OCR header,
+        # because losing the two leading columns shifts every requested value and corrupts status text.
+        if (196 <= source_page <= 237) or "CV4WICR" in joined or "CV4PT-01" in joined:
+            tags=["NCV3PT-01","CV3TT-01","CV4WICR-01","CV4TT-01","CV4PT-01"]
+        elif (275 <= source_page <= 316) or "CV5WICR" in joined or "CV5PT-01" in joined:
+            tags=["CV4AG-01","CV5WICR-01","CV5TT-01","CV5PT-01","CV5AG-01"]
         if not tags: continue
 
         selected=[t for t in tags if t in target]
@@ -1294,7 +1295,7 @@ def safe_table(df,height=650,max_rows=3000,key=None):
     st.dataframe(view,width="stretch",hide_index=True,height=height,row_height=31,key=key)
 
 st.title("Universal ADAM and OMCA ANFDA Multi-Report Extractor")
-st.caption("Build: INTERACTIVE-MULTI-SENSOR-v20 | Correct CV column alignment and visible extracted tables")
+st.caption("Build: INTERACTIVE-MULTI-SENSOR-v21 | Correct CV column alignment and visible extracted tables")
 st.caption("Fast extraction uses Poppler pdftotext, then applies the selected ADAM or OMCA parser. Multiple reports are supported without automatic detection delay.")
 uploads=st.sidebar.file_uploader(
     "Upload multiple report PDFs",
@@ -1336,7 +1337,7 @@ for idx,uploaded in enumerate(uploads):
 legacy_first_page=st.sidebar.number_input("Legacy OCR start page",min_value=1,value=1,step=1,help="Used only for Legacy CV4/CV5 Process Report.")
 legacy_last_page=st.sidebar.number_input("Legacy OCR end page",min_value=1,value=42,step=1,help="Use the internal PDF page numbers, for example 196-237 or 275-316.")
 @st.cache_data(show_spinner=False, max_entries=2, ttl=1800)
-def process_uploaded_report(file_name, raw, selected_type, first_page=1, last_page=None, parser_version="legacy-cv-v1"):
+def process_uploaded_report(file_name, raw, selected_type, first_page=1, last_page=None, parser_version="legacy-cv-v3-fixed-layout"):
     if selected_type=="Legacy CV4/CV5 Process Report (OCR)":
         pages,extraction_engine,text_extraction_seconds=extract_pdf_pages_ocr(raw,first_page,last_page)
     else:
@@ -1392,7 +1393,7 @@ if process_now:
         selected_type=report_type_by_file[uploaded.name]
         progress.progress(i/len(uploads),text=f"Extracting {uploaded.name} as {selected_type} ({i+1} of {len(uploads)})")
         try:
-            reports.append(process_uploaded_report(uploaded.name,uploaded.getvalue(),selected_type,int(legacy_first_page),int(legacy_last_page),"legacy-cv-v1"))
+            reports.append(process_uploaded_report(uploaded.name,uploaded.getvalue(),selected_type,int(legacy_first_page),int(legacy_last_page),"legacy-cv-v3-fixed-layout"))
         except Exception as exc:
             reports.append({"file_name":uploaded.name,"detected_type":"Failed","error":f"{type(exc).__name__}: {exc}","long_df":pd.DataFrame(),"events":pd.DataFrame(),"alarms":pd.DataFrame(),"groups":{},"meta":{"File name":uploaded.name},"adam_score":0,"omca_score":0})
         gc.collect()
@@ -1494,6 +1495,14 @@ m3.metric("Active report tags",len(tags)); m4.metric("Active tag readings",f"{le
 
 summary=(long_df.groupby(["Instrument tag","HMI equipment","HMI measurement name","Unit"],dropna=False,observed=True,as_index=False)
     .agg(Records=("Value","size"),Start=("Date time","min"),End=("Date time","max"),Minimum=("Value","min"),Maximum=("Value","max"),Mean=("Value","mean")))
+
+expected_tags={"CV4WICR-01","CV4TT-01","CV4PT-01"} if int(legacy_first_page)<=237 else {"CV5WICR-01","CV5TT-01","CV5PT-01"}
+found_tags=set(long_df.get("Instrument tag",pd.Series(dtype=str)).astype(str).unique())
+missing_expected=sorted(expected_tags-found_tags)
+if missing_expected:
+    st.error("Extraction integrity check failed. Missing expected tags: "+", ".join(missing_expected)+". Clear cache and reprocess the PDF.")
+else:
+    st.success(f"Extraction integrity check passed: {len(long_df):,} tag-wise rows across {len(found_tags)} requested tags.")
 
 tabs=st.tabs(["Selected tag","Tag summary", "Cross-batch profiles","Extraction audit","Transfer flowrate","HMI tag dictionary","Instrument groups","All tagwise data","Events & alarms","Metadata"])
 with tabs[0]:
