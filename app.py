@@ -676,10 +676,10 @@ def build_cross_batch_wide(valid_reports):
                 .reset_index())
         status = d[["Date time", "Step status"]].drop_duplicates("Date time", keep="first")
         wide = wide.merge(status, on="Date time", how="left")
-        meta = item.get("meta", {})
-        batch = meta.get("Batch number", item["file_name"]) if isinstance(meta, dict) else item["file_name"]
+        # Use the uploaded PDF filename without the extension as the single batch identifier.
+        batch = pdf_name_as_batch_number(item.get("file_name", ""))
         wide.insert(0, "Source report", item["file_name"])
-        wide.insert(1, "Batch", str(batch))
+        wide.insert(1, "Batch", batch)
         frames.append(wide)
     return pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
 
@@ -1268,7 +1268,7 @@ def safe_table(df,height=650,max_rows=3000,key=None):
     st.dataframe(view,width="stretch",hide_index=True,height=height,row_height=31,key=key)
 
 st.title("Universal ADAM and OMCA ANFDA Multi-Report Extractor")
-st.caption("Build: INTERACTIVE-MULTI-SENSOR-v18 | Legacy CV4/CV5 OCR + Excel export")
+st.caption("Build: INTERACTIVE-MULTI-SENSOR-v19 | PDF filename batch labels in cross-batch plots")
 st.caption("Fast extraction uses Poppler pdftotext, then applies the selected ADAM or OMCA parser. Multiple reports are supported without automatic detection delay.")
 uploads=st.sidebar.file_uploader(
     "Upload multiple report PDFs",
@@ -1396,6 +1396,11 @@ st.subheader("Batch processing summary")
 safe_table(summary_df,height=min(520,110+len(summary_df)*38))
 
 valid=[r for r in reports if not r.get("error") and not r.get("long_df",pd.DataFrame()).empty]
+for item in valid:
+    item_batch=pdf_name_as_batch_number(item.get("file_name",""))
+    item.setdefault("meta",{})["Batch number"]=item_batch
+    item["long_df"]=item["long_df"].copy()
+    item["long_df"]["Batch number"]=item_batch
 if not valid:
     st.error("None of the uploaded reports could be processed. Review the summary messages.")
     st.stop()
