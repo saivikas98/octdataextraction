@@ -1232,6 +1232,9 @@ def show_plot_with_downloads(fig, chart_key, file_stem, height=None):
     )
 
 
+def pdf_name_as_batch_number(file_name):
+    return Path(str(file_name)).stem.strip() or "Unknown_Batch"
+
 def dataframe_to_excel_bytes(df, sheet_name="Extracted Data"):
     output=BytesIO()
     with pd.ExcelWriter(output,engine="openpyxl") as writer:
@@ -1399,8 +1402,12 @@ if not valid:
 
 report_names=[r["file_name"] for r in valid]
 active_name=st.sidebar.selectbox("Active report",report_names)
+batch_number=pdf_name_as_batch_number(active_name)
 r=next(x for x in valid if x["file_name"]==active_name)
-long_df=r["long_df"]; groups=r["groups"]; events=r["events"]; alarms=r["alarms"]; meta=r["meta"]; tag_inventory=r.get("tag_inventory",pd.DataFrame())
+long_df=r["long_df"].copy()
+long_df["Batch number"]=batch_number
+long_df=long_df[["Batch number"]+[c for c in long_df.columns if c!="Batch number"]]
+groups=r["groups"]; events=r["events"]; alarms=r["alarms"]; meta=r["meta"]; tag_inventory=r.get("tag_inventory",pd.DataFrame())
 flow_smoothing=st.sidebar.select_slider("Flowrate weight smoothing points",options=[1,3,5,7],value=3,key=f"flow_smoothing_{active_name}")
 flow_points=calculate_interval_flowrates(long_df,flow_smoothing)
 st.sidebar.success(f"Processing as: {r['detected_type']}")
@@ -2007,9 +2014,27 @@ with tabs[6]:
 with tabs[7]:
     search=st.text_input("Search tag, status, unit or timestamp")
     view=long_df
-    if search: view=view[view.astype(str).apply(lambda x:x.str.contains(search,case=False,na=False)).any(axis=1)]
+    if search:
+        view=view[view.astype(str).apply(lambda x:x.str.contains(search,case=False,na=False)).any(axis=1)]
     safe_table(view)
-    st.download_button("Download extracted data as Excel",data=dataframe_to_excel_bytes(view),file_name=f"{Path(active_name).stem}_tagwise_extraction.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",width="stretch",key=f"excel_export_{active_name}")
+    export_scope=st.radio(
+        "Excel export scope",
+        ["Complete extracted table", "Current filtered table"],
+        horizontal=True,
+        key=f"excel_scope_{active_name}",
+    )
+    export_df=long_df if export_scope=="Complete extracted table" else view
+    export_name=f"{batch_number}_complete_extracted_table.xlsx" if export_scope=="Complete extracted table" else f"{batch_number}_filtered_extracted_table.xlsx"
+    st.download_button(
+        f"Download {export_scope.lower()} in Excel",
+        data=dataframe_to_excel_bytes(export_df, "Extracted Table"),
+        file_name=export_name,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        width="stretch",
+        key=f"excel_export_{active_name}_{export_scope}",
+        disabled=export_df.empty,
+    )
+    st.caption(f"Excel export contains {len(export_df):,} extracted rows.")
 with tabs[8]:
     a,b=st.columns(2)
     with a:
@@ -2019,6 +2044,6 @@ with tabs[8]:
         st.subheader(f"Alarm records ({len(alarms):,})")
         safe_table(alarms,height=520) if not alarms.empty else st.info("No alarm records extracted.")
 with tabs[9]:
-    safe_table(pd.DataFrame(meta.items(),columns=["Field","Value"]),height=430)
+    safe_table(pd.DataFrame({"Batch number":batch_number,**meta}.items(),columns=["Field","Value"]),height=430)
 
-st.caption("All PDFs are processed independently in memory. The app does not create or store Excel/CSV files.")
+st.caption("All PDFs are processed independently in memory. Excel files are generated only when you click a download button and are not stored by the app.")
