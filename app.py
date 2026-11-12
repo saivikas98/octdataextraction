@@ -1,6 +1,11 @@
 from io import BytesIO
 from datetime import datetime, timedelta
 import os
+os.environ.setdefault("OMP_THREAD_LIMIT","1")
+os.environ.setdefault("OMP_NUM_THREADS","1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS","1")
+os.environ.setdefault("MKL_NUM_THREADS","1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS","1")
 import subprocess
 import tempfile
 import time
@@ -524,31 +529,47 @@ def parse_process_report(pages):
     return wide,long_df,pd.DataFrame(events),pd.DataFrame(alarms)
 
 def extract_pdf_pages_ocr(raw: bytes, first_page=1, last_page=None):
-    """OCR selected pages for scanned legacy process reports using Poppler + Tesseract."""
+    """Low-CPU, single-pass, page-at-a-time OCR for scanned legacy reports."""
     started=time.perf_counter()
     if not shutil.which("pdftoppm") or not shutil.which("tesseract"):
-        raise RuntimeError("Legacy scanned-report OCR requires pdftoppm and tesseract on the host.")
+        raise RuntimeError("Legacy OCR requires poppler-utils and tesseract-ocr in packages.txt.")
+    first_page=max(1,int(first_page)); last_page=max(first_page,int(last_page or first_page))
+    if last_page-first_page+1>50:
+        raise ValueError("Process a maximum of 50 OCR pages per run on Streamlit Community Cloud.")
+    env=os.environ.copy()
+    env.update({"OMP_THREAD_LIMIT":"1","OMP_NUM_THREADS":"1","OPENBLAS_NUM_THREADS":"1","MKL_NUM_THREADS":"1","NUMEXPR_NUM_THREADS":"1"})
+    pages=[]
     with tempfile.TemporaryDirectory() as tmp:
         pdf_path=os.path.join(tmp,"input.pdf")
         with open(pdf_path,"wb") as f: f.write(raw)
-        cmd=["pdftoppm","-f",str(max(1,int(first_page)))]
-        if last_page:
-            cmd.extend(["-l",str(max(int(first_page),int(last_page)))])
-        cmd.extend(["-r","200","-png",pdf_path,os.path.join(tmp,"page")])
-        subprocess.run(cmd,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,timeout=600,check=True)
-        images=sorted(Path(tmp).glob("page-*.png"))
-        pages=[]
-        for img in images:
-            osd=subprocess.run(["tesseract",str(img),"stdout","--psm","0"],capture_output=True,text=True,timeout=45)
-            m=re.search(r"Rotate:\s*(\d+)",osd.stdout); angle=int(m.group(1)) if m else 0
+        total=last_page-first_page+1
+        status_box=st.empty(); page_progress=st.progress(0,text="Preparing OCR...")
+        for n,page_no in enumerate(range(first_page,last_page+1),1):
+            status_box.caption(f"OCR page {page_no} ({n} of {total})")
+            prefix=os.path.join(tmp,f"page_{page_no}")
+            cmd=["pdftoppm","-f",str(page_no),"-l",str(page_no),"-r","150","-png","-singlefile",pdf_path,prefix]
+            completed=subprocess.run(cmd,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,timeout=90,check=False,env=env)
+            if completed.returncode!=0:
+                raise RuntimeError(f"Poppler failed on page {page_no}: {completed.stderr.decode(errors='replace')[-300:]}")
+            img=Path(prefix+".png")
+            if not img.exists(): raise RuntimeError(f"Rendered image missing for page {page_no}.")
             source=img
-            if angle and shutil.which("magick"):
-                rotated=img.with_name(img.stem+"_rot.png")
-                subprocess.run(["magick",str(img),"-rotate",str(angle),str(rotated)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=45)
+            if shutil.which("magick"):
+                angle=90 if page_no%2 else 270
+                rotated=Path(prefix+"_rot.png")
+                subprocess.run(["magick",str(img),"-rotate",str(angle),str(rotated)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=45,check=True,env=env)
                 source=rotated
-            result=subprocess.run(["tesseract",str(source),"stdout","-l","eng","--psm","4"],capture_output=True,text=True,timeout=90)
+            command=["tesseract",str(source),"stdout","-l","eng","--psm","4"]
+            if shutil.which("nice"): command=["nice","-n","10"]+command
+            result=subprocess.run(command,capture_output=True,text=True,timeout=75,check=False,env=env)
+            if result.returncode!=0:
+                raise RuntimeError(f"Tesseract failed on page {page_no}: {result.stderr[-300:]}")
             pages.append(result.stdout or "")
-        return pages,"Poppler + Tesseract OCR",time.perf_counter()-started
+            img.unlink(missing_ok=True); Path(prefix+"_rot.png").unlink(missing_ok=True)
+            page_progress.progress(n/total,text=f"OCR page {page_no}: {n} of {total}")
+            gc.collect()
+        page_progress.empty(); status_box.empty()
+    return pages,"Low-CPU Poppler 150 DPI + single-pass Tesseract",time.perf_counter()-started
 
 def parse_legacy_cv_report(pages, source_page_offset=0):
     """Parse scanned CV4/CV5 process tables while preserving every source-column position."""
@@ -1295,7 +1316,7 @@ def safe_table(df,height=650,max_rows=3000,key=None):
     st.dataframe(view,width="stretch",hide_index=True,height=height,row_height=31,key=key)
 
 st.title("Universal ADAM and OMCA ANFDA Multi-Report Extractor")
-st.caption("Build: INTERACTIVE-MULTI-SENSOR-v21 | Correct CV column alignment and visible extracted tables")
+st.caption("Build: INTERACTIVE-MULTI-SENSOR-v22 | Low-CPU single-pass CV OCR")
 st.caption("Fast extraction uses Poppler pdftotext, then applies the selected ADAM or OMCA parser. Multiple reports are supported without automatic detection delay.")
 uploads=st.sidebar.file_uploader(
     "Upload multiple report PDFs",
@@ -1337,7 +1358,7 @@ for idx,uploaded in enumerate(uploads):
 legacy_first_page=st.sidebar.number_input("Legacy OCR start page",min_value=1,value=1,step=1,help="Used only for Legacy CV4/CV5 Process Report.")
 legacy_last_page=st.sidebar.number_input("Legacy OCR end page",min_value=1,value=42,step=1,help="Use the internal PDF page numbers, for example 196-237 or 275-316.")
 @st.cache_data(show_spinner=False, max_entries=2, ttl=1800)
-def process_uploaded_report(file_name, raw, selected_type, first_page=1, last_page=None, parser_version="legacy-cv-v3-fixed-layout"):
+def process_uploaded_report(file_name, raw, selected_type, first_page=1, last_page=None, parser_version="legacy-cv-v4-low-cpu"):
     if selected_type=="Legacy CV4/CV5 Process Report (OCR)":
         pages,extraction_engine,text_extraction_seconds=extract_pdf_pages_ocr(raw,first_page,last_page)
     else:
@@ -1393,7 +1414,7 @@ if process_now:
         selected_type=report_type_by_file[uploaded.name]
         progress.progress(i/len(uploads),text=f"Extracting {uploaded.name} as {selected_type} ({i+1} of {len(uploads)})")
         try:
-            reports.append(process_uploaded_report(uploaded.name,uploaded.getvalue(),selected_type,int(legacy_first_page),int(legacy_last_page),"legacy-cv-v3-fixed-layout"))
+            reports.append(process_uploaded_report(uploaded.name,uploaded.getvalue(),selected_type,int(legacy_first_page),int(legacy_last_page),"legacy-cv-v4-low-cpu"))
         except Exception as exc:
             reports.append({"file_name":uploaded.name,"detected_type":"Failed","error":f"{type(exc).__name__}: {exc}","long_df":pd.DataFrame(),"events":pd.DataFrame(),"alarms":pd.DataFrame(),"groups":{},"meta":{"File name":uploaded.name},"adam_score":0,"omca_score":0})
         gc.collect()
