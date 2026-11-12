@@ -528,6 +528,47 @@ def parse_process_report(pages):
         long_df["Step status"]=long_df["Step status"].fillna("").astype(str).str.strip()
     return wide,long_df,pd.DataFrame(events),pd.DataFrame(alarms)
 
+def repair_missing_decimal_points(long_df):
+    """Repair clear OCR decimal-loss outliers from temperature/pressure series.
+
+    The current reading is excluded from the local reference. Decimal candidates
+    value/10, value/100 and value/1000 are tested. A change is accepted only
+    when the candidate agrees closely with neighboring readings and improves
+    the local error by at least 90%. Weight/load-cell readings are excluded.
+    """
+    if long_df is None or long_df.empty or "Value" not in long_df.columns:
+        return long_df
+    out=long_df.copy()
+    out["Value"]=pd.to_numeric(out["Value"],errors="coerce")
+    out["OCR original value"]=out["Value"]
+    out["OCR decimal repaired"]=False
+    for tag,idx in out.sort_values("Date time").groupby("Instrument tag",sort=False).groups.items():
+        upper=str(tag).upper()
+        compact=re.sub(r"[^A-Z0-9]","",upper)
+        is_weight=("WICR" in upper or upper.startswith("LSICR"))
+        is_temp=(upper.startswith(("TICR","TT-")) or re.search(r"CV[45]TT0*1$",compact))
+        is_pressure=(upper.startswith(("PICR","PT-")) or re.search(r"CV[45]PT0*1$",compact))
+        if is_weight or not (is_temp or is_pressure):
+            continue
+        ordered=list(idx)
+        vals=pd.to_numeric(out.loc[ordered,"Value"],errors="coerce")
+        # Neighbor-only reference prevents the malformed value from masking itself.
+        prev_vals=vals.shift(1)
+        next_vals=vals.shift(-1)
+        ref=pd.concat([prev_vals,next_vals],axis=1).median(axis=1,skipna=True)
+        for row_i,current,reference in zip(ordered,vals,ref):
+            if pd.isna(current) or pd.isna(reference) or abs(reference)<0.01:
+                continue
+            candidates=[current/10.0,current/100.0,current/1000.0]
+            best=min(candidates,key=lambda x:abs(x-reference))
+            old_error=abs(current-reference)
+            new_error=abs(best-reference)
+            tolerance=max(0.25,0.08*abs(reference))
+            if abs(current)>=8*abs(reference) and new_error<=tolerance and new_error<=0.10*old_error:
+                out.at[row_i,"Value"]=round(best,6)
+                out.at[row_i,"OCR decimal repaired"]=True
+    return out
+
 def extract_pdf_pages_ocr(raw: bytes, first_page=1, last_page=None):
     """Low-CPU, single-pass, page-at-a-time OCR for scanned legacy reports."""
     started=time.perf_counter()
@@ -1345,7 +1386,7 @@ def safe_table(df,height=650,max_rows=3000,key=None):
     st.dataframe(view,width="stretch",hide_index=True,height=height,row_height=31,key=key)
 
 st.title("Universal ADAM and OMCA ANFDA Multi-Report Extractor")
-st.caption("Build: INTERACTIVE-MULTI-SENSOR-v32 | Legacy sensor dropdown classification fixed")
+st.caption("Build: INTERACTIVE-MULTI-SENSOR-v33 | Robust missing-decimal OCR repair")
 st.caption("Fast extraction uses Poppler pdftotext, then applies the selected ADAM or OMCA parser. Multiple reports are supported without automatic detection delay.")
 uploads=st.sidebar.file_uploader(
     "Upload multiple report PDFs",
@@ -1423,6 +1464,7 @@ def process_uploaded_report(file_name, raw, selected_type, first_page=1, last_pa
         groups,long_df,events,alarms=parse_omca_anfd_report(pages)
     elif selected_type=="Legacy CV4/CV5 Process Report (OCR)":
         groups,long_df,events,alarms,tag_inventory=parse_legacy_cv_report(pages,int(first_page)-1)
+        long_df=repair_missing_decimal_points(long_df)
     else:
         error="Select a valid report type."
     if error is None and long_df.empty:
