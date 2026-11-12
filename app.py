@@ -528,6 +528,28 @@ def parse_process_report(pages):
         long_df["Step status"]=long_df["Step status"].fillna("").astype(str).str.strip()
     return wide,long_df,pd.DataFrame(events),pd.DataFrame(alarms)
 
+def repair_legacy_ocr_missing_decimals(long_df):
+    """Repair strong missing-decimal OCR anomalies using adjacent sensor readings."""
+    if long_df is None or long_df.empty: return long_df
+    out=long_df.copy().sort_values(["Instrument tag","Date time"])
+    out["OCR original value"]=pd.to_numeric(out["Value"],errors="coerce")
+    out["OCR decimal repaired"]=False
+    for tag,idx in out.groupby("Instrument tag",sort=False).groups.items():
+        upper=str(tag).upper()
+        if "WICR" in upper or upper.startswith("LSICR"): continue
+        values=pd.to_numeric(out.loc[idx,"Value"],errors="coerce")
+        local=values.rolling(7,center=True,min_periods=2).median()
+        for row_i,current,reference in zip(idx,values,local):
+            if pd.isna(current) or pd.isna(reference) or abs(reference)<1e-9: continue
+            candidates=[current/10.0,current/100.0,current/1000.0]
+            best=min(candidates,key=lambda x:abs(x-reference))
+            if (abs(current)>=10*max(abs(reference),1.0)
+                and abs(best-reference)<=0.20*max(abs(reference),1.0)
+                and abs(best-reference)<0.10*abs(current-reference)):
+                out.at[row_i,"Value"]=best
+                out.at[row_i,"OCR decimal repaired"]=True
+    return out.sort_index()
+
 def extract_pdf_pages_ocr(raw: bytes, first_page=1, last_page=None):
     """Low-CPU, single-pass, page-at-a-time OCR for scanned legacy reports."""
     started=time.perf_counter()
@@ -947,11 +969,11 @@ def build_multi_sensor_profile(profile, tags, title=None, y_ranges=None, highlig
 
     def sensor_family(tag):
         upper=str(tag).upper()
-        if upper.startswith("LSICR") or "WICR" in upper:
+        if upper.startswith("LSICR"):
             return "Weight (kg)"
-        if upper.startswith(("TICR","TT-")) or re.search(r"(?:^|\d)TT-?0?1$", upper):
+        if upper.startswith(("TICR","TT-")):
             return "Temperature (°C)"
-        if upper.startswith(("PICR","PT-")) or re.search(r"(?:^|\d)PT-?0?1$", upper):
+        if upper.startswith(("PICR","PT-")):
             return "Pressure (bar)"
         return "Value"
 
@@ -1092,9 +1114,9 @@ def build_cross_batch_sensor_profile(profile, tags, title, y_ranges=None, highli
 
     def sensor_family(tag):
         upper=str(tag).upper()
-        if upper.startswith("LSICR") or "WICR" in upper: return "Weight (kg)"
-        if upper.startswith(("TICR","TT-")) or re.search(r"(?:^|\d)TT-?0?1$", upper): return "Temperature (°C)"
-        if upper.startswith(("PICR","PT-")) or re.search(r"(?:^|\d)PT-?0?1$", upper): return "Pressure (bar)"
+        if upper.startswith("LSICR"): return "Weight (kg)"
+        if upper.startswith(("TICR","TT-")): return "Temperature (°C)"
+        if upper.startswith(("PICR","PT-")): return "Pressure (bar)"
         return "Value"
 
     families=[]
@@ -1164,11 +1186,11 @@ def build_single_sensor_profile(profile, tag, title=None, y_range=None, highligh
         return go.Figure()
 
     upper=str(tag).upper()
-    if upper.startswith("LSICR") or "WICR" in upper:
+    if upper.startswith("LSICR"):
         unit="kg"; y_title=f"{tag} weight (kg)"
-    elif upper.startswith(("TICR","TT-")) or re.search(r"(?:^|\d)TT-?0?1$", upper):
+    elif upper.startswith(("TICR","TT-")):
         unit="°C"; y_title=f"{tag} temperature (°C)"
-    elif upper.startswith(("PICR","PT-")) or re.search(r"(?:^|\d)PT-?0?1$", upper):
+    elif upper.startswith(("PICR","PT-")):
         unit="bar"; y_title=f"{tag} pressure (bar)"
     else:
         unit=""; y_title=tag
@@ -1347,7 +1369,7 @@ def safe_table(df,height=650,max_rows=3000,key=None):
     st.dataframe(view,width="stretch",hide_index=True,height=height,row_height=31,key=key)
 
 st.title("Universal ADAM and OMCA ANFDA Multi-Report Extractor")
-st.caption("Build: INTERACTIVE-MULTI-SENSOR-v27 | Legacy CV4/CV5 sensor selection fixed")
+st.caption("Build: INTERACTIVE-MULTI-SENSOR-v28 | Sensor selection and OCR decimal repair fixed")
 st.caption("Fast extraction uses Poppler pdftotext, then applies the selected ADAM or OMCA parser. Multiple reports are supported without automatic detection delay.")
 uploads=st.sidebar.file_uploader(
     "Upload multiple report PDFs",
@@ -1406,6 +1428,7 @@ def process_uploaded_report(file_name, raw, selected_type, first_page=1, last_pa
         groups,long_df,events,alarms=parse_omca_anfd_report(pages)
     elif selected_type=="Legacy CV4/CV5 Process Report (OCR)":
         groups,long_df,events,alarms,tag_inventory=parse_legacy_cv_report(pages,int(first_page)-1)
+        long_df=repair_legacy_ocr_missing_decimals(long_df)
     else:
         error="Select a valid report type."
     if error is None and long_df.empty:
@@ -1696,18 +1719,12 @@ with tabs[2]:
         )
         effective_highlight_step=highlight_step if highlight_enabled else None
 
-        # Classify sensors from the complete selected sequence. Legacy CV4/CV5
-        # tags do not begin with TICR/PICR/LSICR, so explicitly recognize
-        # CV4TT/CV5TT, CV4PT/CV5PT, and CV4WICR/CV5WICR.
         columns=[str(c) for c in chronological.columns]
         def profile_sensor_family(tag):
             upper=str(tag).upper().strip()
-            if upper.startswith("LSICR") or "WICR" in upper:
-                return "loadcell"
-            if upper.startswith(("TICR","TT-")) or re.search(r"^CV[45]TT-0?1$",upper):
-                return "temperature"
-            if upper.startswith(("PICR","PT-")) or re.search(r"^CV[45]PT-0?1$",upper):
-                return "pressure"
+            if upper.startswith("LSICR") or "WICR" in upper: return "loadcell"
+            if upper.startswith(("TICR","TT-")) or re.search(r"^CV[45]TT-0?1$",upper): return "temperature"
+            if upper.startswith(("PICR","PT-")) or re.search(r"^CV[45]PT-0?1$",upper): return "pressure"
             return "other"
         temperature_tags=sorted(c for c in columns if profile_sensor_family(c)=="temperature")
         pressure_tags=sorted(c for c in columns if profile_sensor_family(c)=="pressure")
