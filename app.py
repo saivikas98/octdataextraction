@@ -678,7 +678,95 @@ def identify_profile_windows(data, selected_steps, gap_minutes=10):
         options.append({"id":window_id,"label":label,"start":start,"end":end,"gain":gain,"steps":steps})
     return d,options
 
-def build_multi_sensor_profile(profile, tags, title=None, y_ranges=None):
+def normalize_step_name(value):
+    """Normalize report step names so hyphens/spaces do not prevent matching."""
+    return re.sub(r"[^A-Z0-9]+", "", str(value or "").upper())
+
+
+def add_target_step_highlight(
+    fig,
+    profile,
+    tags,
+    axis_for_tag,
+    target_step,
+    x_column,
+    highlight_color="#FFC000",
+    band_opacity=0.12,
+    show_band=True,
+):
+    """Overlay a bold line and optional vertical band for one process step.
+
+    A separate highlighted segment is drawn for every batch and selected sensor.
+    This is suitable for cross-batch plots because each batch can enter the
+    target step at a different elapsed time.
+    """
+    if profile is None or profile.empty or not target_step:
+        return fig
+    required={"Batch","Step status",x_column}
+    if not required.issubset(profile.columns):
+        return fig
+
+    target_norm=normalize_step_name(target_step)
+    if not target_norm:
+        return fig
+    work=profile.copy()
+    work["_step_norm"]=work["Step status"].map(normalize_step_name)
+    work=work[work["_step_norm"]==target_norm].copy()
+    if work.empty:
+        return fig
+
+    # Highlight each contiguous occurrence. A five-minute gap starts a new block.
+    legend_added=False
+    for batch_name,batch_data in work.groupby("Batch",sort=False):
+        batch_data=batch_data.sort_values(x_column).copy()
+        gap=pd.to_numeric(batch_data[x_column],errors="coerce").diff()
+        batch_data["_highlight_block"]=(gap.isna()|gap.gt(5)).cumsum()
+        for _,block in batch_data.groupby("_highlight_block",sort=True):
+            x_values=pd.to_numeric(block[x_column],errors="coerce").dropna()
+            if x_values.empty:
+                continue
+            x0=float(x_values.min()); x1=float(x_values.max())
+            # Give a one-sample step a visible width without overstating duration.
+            if x1<=x0:
+                x1=x0+0.5
+            if show_band:
+                fig.add_vrect(
+                    x0=x0,
+                    x1=x1,
+                    fillcolor=highlight_color,
+                    opacity=float(band_opacity),
+                    line_width=1,
+                    line_color=highlight_color,
+                    layer="below",
+                )
+            for tag in tags:
+                if tag not in block.columns:
+                    continue
+                segment=block[[x_column,tag,"Batch","Step status","Date time"]].dropna(subset=[tag]).sort_values(x_column)
+                if segment.empty:
+                    continue
+                fig.add_trace(go.Scatter(
+                    x=segment[x_column],
+                    y=segment[tag],
+                    mode="lines+markers",
+                    name=f"Highlighted: {target_step}",
+                    legendgroup="target_step_highlight",
+                    showlegend=not legend_added,
+                    yaxis=axis_for_tag.get(tag,"y"),
+                    line=dict(color=highlight_color,width=6),
+                    marker=dict(color=highlight_color,size=9,line=dict(color="white",width=1)),
+                    customdata=segment[["Batch","Step status","Date time"]].astype(str).to_numpy(),
+                    hovertemplate=(
+                        f"Highlighted step={target_step}<br>Batch=%{{customdata[0]}}"
+                        f"<br>Sensor={tag}<br>Step=%{{customdata[1]}}"
+                        "<br>Elapsed=%{x:.1f} min<br>Actual time=%{customdata[2]}"
+                        "<br>Value=%{y:.3f}<extra></extra>"
+                    ),
+                ))
+                legend_added=True
+    return fig
+
+def build_multi_sensor_profile(profile, tags, title=None, y_ranges=None, highlight_step=None, highlight_color="#FFC000", highlight_opacity=0.12, show_highlight_band=True):
     """Overlay multiple selected sensors in one interactive graph.
 
     Sensors are assigned to separate Y-axis families so weight, temperature,
@@ -788,6 +876,12 @@ def build_multi_sensor_profile(profile, tags, title=None, y_ranges=None):
                 position=max(0.78,1-(i-1)*0.08),
             )
 
+    axis_for_tag={tag:axis_for.get(sensor_family(tag),"y") for tag in tags}
+    fig=add_target_step_highlight(
+        fig,d,tags,axis_for_tag,highlight_step,"Elapsed time (min)",
+        highlight_color=highlight_color,band_opacity=highlight_opacity,
+        show_band=show_highlight_band,
+    )
     tick_source=d.drop_duplicates("Elapsed time (min)").sort_values("Elapsed time (min)")
     if len(tick_source)>8:
         positions=[round(i*(len(tick_source)-1)/7) for i in range(8)]
@@ -828,7 +922,7 @@ def build_multi_sensor_profile(profile, tags, title=None, y_ranges=None):
     )
     return fig
 
-def build_cross_batch_sensor_profile(profile, tags, title, y_ranges=None):
+def build_cross_batch_sensor_profile(profile, tags, title, y_ranges=None, highlight_step=None, highlight_color="#FFC000", highlight_opacity=0.12, show_highlight_band=True):
     """Overlay selected batches with elapsed minutes below and actual date/time above."""
     if profile.empty or not tags:
         return go.Figure()
@@ -864,6 +958,12 @@ def build_cross_batch_sensor_profile(profile, tags, title, y_ranges=None):
             ))
             trace_index+=1
 
+    axis_for_tag={tag:axis_for.get(sensor_family(tag),"y") for tag in tags}
+    fig=add_target_step_highlight(
+        fig,profile,tags,axis_for_tag,highlight_step,"Elapsed time (min)",
+        highlight_color=highlight_color,band_opacity=highlight_opacity,
+        show_band=show_highlight_band,
+    )
     # Secondary top X-axis: actual date/time labels corresponding to elapsed-time positions.
     tick_source=(profile.sort_values("Elapsed time (min)")
                  .drop_duplicates("Elapsed time (min)"))
@@ -893,7 +993,7 @@ def build_cross_batch_sensor_profile(profile, tags, title, y_ranges=None):
     )
     return fig
 
-def build_single_sensor_profile(profile, tag, title=None, y_range=None):
+def build_single_sensor_profile(profile, tag, title=None, y_range=None, highlight_step=None, highlight_color="#FFC000", highlight_opacity=0.12, show_highlight_band=True):
     """Plot one sensor from sequence start to end with process-step highlighting."""
     if profile.empty or tag not in profile.columns:
         return go.Figure()
@@ -942,6 +1042,11 @@ def build_single_sensor_profile(profile, tag, title=None, y_range=None):
             marker=dict(size=14,symbol="square",color=step_colors[i%len(step_colors)]),hoverinfo="skip",
         ))
 
+    fig=add_target_step_highlight(
+        fig,d,[tag],{tag:"y"},highlight_step,"Elapsed time (min)",
+        highlight_color=highlight_color,band_opacity=highlight_opacity,
+        show_band=show_highlight_band,
+    )
     tick_source=d.drop_duplicates("Elapsed time (min)").sort_values("Elapsed time (min)")
     if len(tick_source)>8:
         positions=[round(i*(len(tick_source)-1)/7) for i in range(8)]
@@ -1064,7 +1169,7 @@ def safe_table(df,height=650,max_rows=3000,key=None):
     st.dataframe(view,width="stretch",hide_index=True,height=height,row_height=31,key=key)
 
 st.title("Universal ADAM and OMCA ANFDA Multi-Report Extractor")
-st.caption("Build: INTERACTIVE-MULTI-SENSOR-v16 | All chart labels editable")
+st.caption("Build: INTERACTIVE-MULTI-SENSOR-v17 | Selected-step profile highlighting")
 st.caption("Fast extraction uses Poppler pdftotext, then applies the selected ADAM or OMCA parser. Multiple reports are supported without automatic detection delay.")
 uploads=st.sidebar.file_uploader(
     "Upload multiple report PDFs",
@@ -1313,6 +1418,54 @@ with tabs[2]:
         with st.expander("Sequence selected for each batch"):
             safe_table(pd.DataFrame(sequence_rows),height=300)
 
+        st.markdown("#### Highlight a process step in the profile")
+        available_highlight_steps=[]
+        for step_value in chronological["Step status"].dropna().astype(str):
+            if step_value.strip() and step_value not in available_highlight_steps:
+                available_highlight_steps.append(step_value)
+        preferred_highlight="TRANSFER FROM SFV01 TO MV04"
+        preferred_norm=normalize_step_name(preferred_highlight)
+        default_highlight_index=0
+        for step_index,step_value in enumerate(available_highlight_steps):
+            if normalize_step_name(step_value)==preferred_norm:
+                default_highlight_index=step_index
+                break
+        highlight_enabled=st.checkbox(
+            "Highlight selected process step",
+            value=True,
+            key="highlight_process_step_v17",
+        )
+        highlight_c1,highlight_c2,highlight_c3=st.columns([2.4,1,1])
+        with highlight_c1:
+            highlight_step=st.selectbox(
+                "Process step to highlight",
+                available_highlight_steps,
+                index=default_highlight_index,
+                key="highlight_step_name_v17",
+                help="The default selection is TRANSFER FROM SFV01 TO MV04 when that step exists in the report.",
+            ) if available_highlight_steps else None
+        with highlight_c2:
+            highlight_color=st.color_picker(
+                "Highlight color",
+                value="#FFC000",
+                key="highlight_step_color_v17",
+            )
+        with highlight_c3:
+            highlight_opacity=st.slider(
+                "Band opacity",
+                min_value=0.03,
+                max_value=0.35,
+                value=0.12,
+                step=0.01,
+                key="highlight_step_opacity_v17",
+            )
+        show_highlight_band=st.checkbox(
+            "Show vertical shaded band in addition to the bold highlighted line",
+            value=True,
+            key="highlight_step_band_v17",
+        )
+        effective_highlight_step=highlight_step if highlight_enabled else None
+
         columns=[str(c) for c in chronological.columns]
         temperature_tags=sorted(c for c in columns if c.upper().startswith(("TICR","TT-")))
         pressure_tags=sorted(c for c in columns if c.upper().startswith(("PICR","PT-")))
@@ -1452,25 +1605,41 @@ with tabs[2]:
             st.info("Select at least one sensor.")
         elif len(selected_batches)>1:
             if plot_mode.startswith("Multiple"):
-                fig=build_cross_batch_sensor_profile(chronological,selected_tags,custom_cross_batch_title,y_ranges=y_axis_ranges)
+                fig=build_cross_batch_sensor_profile(
+                    chronological,selected_tags,custom_cross_batch_title,y_ranges=y_axis_ranges,
+                    highlight_step=effective_highlight_step,highlight_color=highlight_color,
+                    highlight_opacity=highlight_opacity,show_highlight_band=show_highlight_band,
+                )
                 fig=apply_editable_axis_titles(fig,custom_cross_batch_title,custom_x_title,custom_top_x_title,custom_axis_titles,custom_profile_legend_title)
                 show_plot_with_downloads(fig,"cross_batch_multi_v9",f"{'_'.join(selected_batches)}_multi_sensor",740)
             else:
                 for tag in selected_tags:
                     individual_title=custom_individual_title_template.replace("{tag}",str(tag))
-                    fig=build_cross_batch_sensor_profile(chronological,[tag],individual_title,y_ranges=y_axis_ranges)
+                    fig=build_cross_batch_sensor_profile(
+                        chronological,[tag],individual_title,y_ranges=y_axis_ranges,
+                        highlight_step=effective_highlight_step,highlight_color=highlight_color,
+                        highlight_opacity=highlight_opacity,show_highlight_band=show_highlight_band,
+                    )
                     fig=apply_editable_axis_titles(fig,individual_title,custom_x_title,custom_top_x_title,custom_axis_titles,custom_profile_legend_title)
                     show_plot_with_downloads(fig,f"cross_batch_{tag}_v9",f"{'_'.join(selected_batches)}_{tag}",700)
         else:
             one=chronological[chronological["Batch"].astype(str)==selected_batches[0]].copy()
             if plot_mode.startswith("Multiple"):
-                fig=build_multi_sensor_profile(one,selected_tags,custom_multi_sensor_title,y_ranges=y_axis_ranges)
+                fig=build_multi_sensor_profile(
+                    one,selected_tags,custom_multi_sensor_title,y_ranges=y_axis_ranges,
+                    highlight_step=effective_highlight_step,highlight_color=highlight_color,
+                    highlight_opacity=highlight_opacity,show_highlight_band=show_highlight_band,
+                )
                 fig=apply_editable_axis_titles(fig,custom_multi_sensor_title,custom_x_title,custom_top_x_title,custom_axis_titles,custom_profile_legend_title)
                 show_plot_with_downloads(fig,"single_batch_multi_v9",f"{selected_batches[0]}_multi_sensor",740)
             else:
                 for tag in selected_tags:
                     individual_title=custom_individual_title_template.replace("{tag}",str(tag))
-                    fig=build_single_sensor_profile(one,tag,individual_title,y_range=y_axis_ranges.get(tag))
+                    fig=build_single_sensor_profile(
+                        one,tag,individual_title,y_range=y_axis_ranges.get(tag),
+                        highlight_step=effective_highlight_step,highlight_color=highlight_color,
+                        highlight_opacity=highlight_opacity,show_highlight_band=show_highlight_band,
+                    )
                     fig=apply_editable_axis_titles(fig,individual_title,custom_x_title,custom_top_x_title,custom_axis_titles,custom_profile_legend_title)
                     show_plot_with_downloads(fig,f"single_batch_{tag}_v9",f"{selected_batches[0]}_{tag}",700)
         display_columns=["Source report","Batch","Date time","Elapsed time (min)","Step status"]+selected_tags
