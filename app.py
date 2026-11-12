@@ -1345,7 +1345,7 @@ def safe_table(df,height=650,max_rows=3000,key=None):
     st.dataframe(view,width="stretch",hide_index=True,height=height,row_height=31,key=key)
 
 st.title("Universal ADAM and OMCA ANFDA Multi-Report Extractor")
-st.caption("Build: INTERACTIVE-MULTI-SENSOR-v31 | Per-PDF ranges and integrity check fixed")
+st.caption("Build: INTERACTIVE-MULTI-SENSOR-v32 | Legacy sensor dropdown classification fixed")
 st.caption("Fast extraction uses Poppler pdftotext, then applies the selected ADAM or OMCA parser. Multiple reports are supported without automatic detection delay.")
 uploads=st.sidebar.file_uploader(
     "Upload multiple report PDFs",
@@ -1729,17 +1729,29 @@ with tabs[2]:
         )
         effective_highlight_step=highlight_step if highlight_enabled else None
 
-        columns=[str(c) for c in chronological.columns]
-        temperature_tags=sorted(c for c in columns if c.upper().startswith(("TICR","TT-")))
-        pressure_tags=sorted(c for c in columns if c.upper().startswith(("PICR","PT-")))
-        loadcell_tags=sorted(c for c in columns if c.upper().startswith("LSICR"))
+        # Classify all available columns, including Legacy CV4/CV5 tag names.
+        columns=[str(c).strip() for c in chronological.columns]
+        def profile_sensor_family(tag):
+            upper=str(tag).upper().strip()
+            compact=re.sub(r"[^A-Z0-9]","",upper)
+            if upper.startswith("LSICR") or "WICR" in upper or compact.startswith(("CV4WICR","CV5WICR")):
+                return "loadcell"
+            if upper.startswith(("TICR","TT-")) or re.search(r"CV[45]TT0*1$",compact):
+                return "temperature"
+            if upper.startswith(("PICR","PT-")) or re.search(r"CV[45]PT0*1$",compact):
+                return "pressure"
+            return "other"
+        temperature_tags=sorted(c for c in columns if profile_sensor_family(c)=="temperature")
+        pressure_tags=sorted(c for c in columns if profile_sensor_family(c)=="pressure")
+        loadcell_tags=sorted(c for c in columns if profile_sensor_family(c)=="loadcell")
         c1,c2,c3=st.columns(3)
+        sensor_key_suffix=re.sub(r"[^A-Za-z0-9]+","_",str(active_name))
         with c1:
-            selected_temp=st.multiselect("Temperature sensors",temperature_tags,default=[x for x in ["TICR008"] if x in temperature_tags],key="multi_batch_temp_v9")
+            selected_temp=st.multiselect("Temperature sensors",temperature_tags,default=[x for x in ["TICR008","CV4TT-01","CV5TT-01"] if x in temperature_tags],key=f"multi_batch_temp_v32_{sensor_key_suffix}")
         with c2:
-            selected_pressure=st.multiselect("Pressure sensors",pressure_tags,default=[x for x in ["PICR006"] if x in pressure_tags],key="multi_batch_pressure_v9")
+            selected_pressure=st.multiselect("Pressure sensors",pressure_tags,default=[x for x in ["PICR006","CV4PT-01","CV5PT-01"] if x in pressure_tags],key=f"multi_batch_pressure_v32_{sensor_key_suffix}")
         with c3:
-            selected_load=st.multiselect("Load-cell sensors",loadcell_tags,default=[x for x in ["LSICR004","LSICR005"] if x in loadcell_tags],key="multi_batch_load_v9")
+            selected_load=st.multiselect("Load-cell sensors",loadcell_tags,default=[x for x in ["LSICR004","LSICR005","CV4WICR-01","CV5WICR-01"] if x in loadcell_tags],key=f"multi_batch_load_v32_{sensor_key_suffix}")
         selected_tags=list(dict.fromkeys(selected_load+selected_pressure+selected_temp))[:12]
 
         st.markdown("#### Editable plot and axis titles")
