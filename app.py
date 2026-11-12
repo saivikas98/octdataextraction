@@ -987,7 +987,7 @@ def apply_plot_font_sizes(fig):
     fig.update_yaxes(title_font=dict(size=plot_axis_title_font),tickfont=dict(size=plot_tick_font))
     return fig
 
-def apply_editable_axis_titles(fig, plot_title, bottom_x_title, top_x_title, family_titles):
+def apply_editable_axis_titles(fig, plot_title, bottom_x_title, top_x_title, family_titles, legend_title=None):
     """Apply user-entered titles to existing Plotly axes without changing data."""
     fig.update_layout(title_text=plot_title)
     fig.update_xaxes(title_text=bottom_x_title, row=None, col=None)
@@ -995,6 +995,8 @@ def apply_editable_axis_titles(fig, plot_title, bottom_x_title, top_x_title, fam
         fig.layout.xaxis2.title.text=top_x_title
     # Preserve axis-family order used by multi-sensor plots.
     existing_yaxes=[k for k in fig.layout if str(k).startswith("yaxis")]
+    if legend_title is not None:
+        fig.update_layout(legend_title_text=legend_title)
     for axis_name in existing_yaxes:
         axis=getattr(fig.layout,axis_name)
         old=(axis.title.text or "") if axis.title else ""
@@ -1062,7 +1064,7 @@ def safe_table(df,height=650,max_rows=3000,key=None):
     st.dataframe(view,width="stretch",hide_index=True,height=height,row_height=31,key=key)
 
 st.title("Universal ADAM and OMCA ANFDA Multi-Report Extractor")
-st.caption("Build: INTERACTIVE-MULTI-SENSOR-v14 | Editable titles + graphical statistics")
+st.caption("Build: INTERACTIVE-MULTI-SENSOR-v16 | All chart labels editable")
 st.caption("Fast extraction uses Poppler pdftotext, then applies the selected ADAM or OMCA parser. Multiple reports are supported without automatic detection delay.")
 uploads=st.sidebar.file_uploader(
     "Upload multiple report PDFs",
@@ -1356,6 +1358,55 @@ with tabs[2]:
             "Temperature (°C)":custom_temperature_y_title,
             "Pressure (bar)":custom_pressure_y_title,
         }
+        st.markdown("##### Individual and comparison chart titles")
+        editable_c1,editable_c2=st.columns(2)
+        with editable_c1:
+            custom_multi_sensor_title=st.text_input(
+                "Multi-sensor chart title",
+                value=custom_plot_title,
+                key="custom_multi_sensor_title_v15",
+            )
+            custom_cross_batch_title=st.text_input(
+                "Cross-batch chart title",
+                value="Cross-Batch Process Profile",
+                key="custom_cross_batch_title_v15",
+            )
+        with editable_c2:
+            custom_individual_title_template=st.text_input(
+                "Individual-sensor title template",
+                value="{tag} Process Profile",
+                key="custom_individual_title_template_v15",
+                help="Use {tag} where the sensor tag should appear.",
+            )
+            custom_flowrate_title=st.text_input(
+                "Flowrate chart title",
+                value="Interval Material-Transfer Flowrate",
+                key="custom_flowrate_title_v15",
+            )
+            custom_profile_legend_title=st.text_input(
+                "Profile legend title",
+                value="Batch | Sensor | Process status",
+                key="custom_profile_legend_title_v16",
+            )
+        flow_label_c1,flow_label_c2,flow_label_c3=st.columns(3)
+        with flow_label_c1:
+            custom_flowrate_x_title=st.text_input(
+                "Flowrate X-axis title",
+                value="Date time",
+                key="custom_flowrate_x_title_v16",
+            )
+        with flow_label_c2:
+            custom_flowrate_y_title=st.text_input(
+                "Flowrate Y-axis title",
+                value="Flowrate (kg/min)",
+                key="custom_flowrate_y_title_v16",
+            )
+        with flow_label_c3:
+            custom_flowrate_legend_title=st.text_input(
+                "Flowrate legend title",
+                value="Transfer direction",
+                key="custom_flowrate_legend_title_v16",
+            )
 
         st.markdown("#### Manual Y-axis limits")
         manual_y_axis=st.checkbox(
@@ -1401,26 +1452,26 @@ with tabs[2]:
             st.info("Select at least one sensor.")
         elif len(selected_batches)>1:
             if plot_mode.startswith("Multiple"):
-                fig=build_cross_batch_sensor_profile(chronological,selected_tags,custom_plot_title,y_ranges=y_axis_ranges)
-                fig=apply_editable_axis_titles(fig,custom_plot_title,custom_x_title,custom_top_x_title,custom_axis_titles)
+                fig=build_cross_batch_sensor_profile(chronological,selected_tags,custom_cross_batch_title,y_ranges=y_axis_ranges)
+                fig=apply_editable_axis_titles(fig,custom_cross_batch_title,custom_x_title,custom_top_x_title,custom_axis_titles,custom_profile_legend_title)
                 show_plot_with_downloads(fig,"cross_batch_multi_v9",f"{'_'.join(selected_batches)}_multi_sensor",740)
             else:
                 for tag in selected_tags:
-                    individual_title=f"{custom_plot_title} | {tag}"
+                    individual_title=custom_individual_title_template.replace("{tag}",str(tag))
                     fig=build_cross_batch_sensor_profile(chronological,[tag],individual_title,y_ranges=y_axis_ranges)
-                    fig=apply_editable_axis_titles(fig,individual_title,custom_x_title,custom_top_x_title,custom_axis_titles)
+                    fig=apply_editable_axis_titles(fig,individual_title,custom_x_title,custom_top_x_title,custom_axis_titles,custom_profile_legend_title)
                     show_plot_with_downloads(fig,f"cross_batch_{tag}_v9",f"{'_'.join(selected_batches)}_{tag}",700)
         else:
             one=chronological[chronological["Batch"].astype(str)==selected_batches[0]].copy()
             if plot_mode.startswith("Multiple"):
-                fig=build_multi_sensor_profile(one,selected_tags,custom_plot_title,y_ranges=y_axis_ranges)
-                fig=apply_editable_axis_titles(fig,custom_plot_title,custom_x_title,custom_top_x_title,custom_axis_titles)
+                fig=build_multi_sensor_profile(one,selected_tags,custom_multi_sensor_title,y_ranges=y_axis_ranges)
+                fig=apply_editable_axis_titles(fig,custom_multi_sensor_title,custom_x_title,custom_top_x_title,custom_axis_titles,custom_profile_legend_title)
                 show_plot_with_downloads(fig,"single_batch_multi_v9",f"{selected_batches[0]}_multi_sensor",740)
             else:
                 for tag in selected_tags:
-                    individual_title=f"{custom_plot_title} | {tag}"
+                    individual_title=custom_individual_title_template.replace("{tag}",str(tag))
                     fig=build_single_sensor_profile(one,tag,individual_title,y_range=y_axis_ranges.get(tag))
-                    fig=apply_editable_axis_titles(fig,individual_title,custom_x_title,custom_top_x_title,custom_axis_titles)
+                    fig=apply_editable_axis_titles(fig,individual_title,custom_x_title,custom_top_x_title,custom_axis_titles,custom_profile_legend_title)
                     show_plot_with_downloads(fig,f"single_batch_{tag}_v9",f"{selected_batches[0]}_{tag}",700)
         display_columns=["Source report","Batch","Date time","Elapsed time (min)","Step status"]+selected_tags
         safe_table(chronological[display_columns],height=650,max_rows=max(3000,len(chronological)),key="multi_batch_profile_table_v9")
@@ -1528,6 +1579,24 @@ with tabs[2]:
                 value="Temperature Statistics Across Process Steps",
                 key="temperature_statistics_title_v14",
             )
+            stats_title_c1,stats_title_c2=st.columns(2)
+            with stats_title_c1:
+                statistics_x_title=st.text_input(
+                    "Statistical X-axis title",
+                    value="Process step",
+                    key="temperature_statistics_x_title_v15",
+                )
+            with stats_title_c2:
+                statistics_y_title=st.text_input(
+                    "Statistical Y-axis title",
+                    value="Temperature (°C)",
+                    key="temperature_statistics_y_title_v15",
+                )
+            statistics_legend_title=st.text_input(
+                "Statistical legend / color-scale title",
+                value="Batch | Sensor",
+                key="temperature_statistics_legend_title_v16",
+            )
 
             if statistic_chart_type=="Mean with minimum-maximum band":
                 stats_fig=go.Figure()
@@ -1557,7 +1626,7 @@ with tabs[2]:
                                        "<br>Count=%{customdata[3]}<extra></extra>"),
                     ))
                 stats_fig.update_layout(
-                    title=statistics_plot_title,xaxis_title="Process step",yaxis_title="Temperature (°C)",
+                    title=statistics_plot_title,xaxis_title=statistics_x_title,yaxis_title=statistics_y_title,
                     template="plotly_white",height=650,hovermode="x unified",xaxis_tickangle=-35,
                     legend_title="Batch | Sensor",margin=dict(b=190),
                 )
@@ -1583,6 +1652,11 @@ with tabs[2]:
                 )
                 stats_fig.update_layout(height=max(480,100+55*len(heat)),xaxis_tickangle=-35,margin=dict(b=190))
 
+            stats_fig.update_xaxes(title_text=statistics_x_title)
+            stats_fig.update_yaxes(title_text=statistics_y_title)
+            stats_fig.update_layout(legend_title_text=statistics_legend_title)
+            if statistic_chart_type=="Heatmap":
+                stats_fig.update_coloraxes(colorbar_title_text=statistics_legend_title)
             stats_fig=apply_plot_font_sizes(stats_fig)
             show_plot_with_downloads(
                 stats_fig,
@@ -1635,7 +1709,12 @@ with tabs[4]:
             st.info("No valid consecutive intervals are available for the selected step.")
         else:
             plot=measurable.iloc[::max(1,len(measurable)//3000)]
-            fig=px.line(plot,x="Date time",y="Flowrate (kg/min)",color="Transfer direction",markers=True,title=f"Interval flowrate: {flow_tag} | {flow_step}")
+            fig=px.line(plot,x="Date time",y="Flowrate (kg/min)",color="Transfer direction",markers=True,title=f"{custom_flowrate_title}: {flow_tag} | {flow_step}")
+            fig.update_layout(
+                xaxis_title=custom_flowrate_x_title,
+                yaxis_title=custom_flowrate_y_title,
+                legend_title_text=custom_flowrate_legend_title,
+            )
             show_plot_with_downloads(
                 fig,
                 chart_key=f"interval_flow_plot_{active_name}_{flow_tag}_{flow_step}",
