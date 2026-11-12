@@ -12,6 +12,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 import pdfplumber
+import shutil
 from pathlib import Path
 
 
@@ -43,8 +44,8 @@ plot_hover_font=st.sidebar.slider("Hover-label font size",8,26,12,1,key="hover_f
 
 DATE_RE = re.compile(r"^(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2}:\d{2})\s+(.+)$")
 NUMBER_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
-TAG_RE = re.compile(r"^(?:LSICR|PICR|TICR|TA|TLP|RLS|CP|PT|TT|XV|DP|QI?CR|CI?CR|MFM)[A-Z0-9_-]*$", re.I)
-TAG_TOKEN_RE = re.compile(r"(?:LSICR|PICR|TICR|TA|TLP|RLS|CP|PT|TT|XV|DP|QICR|CICR|MFM)[A-Z0-9_-]*", re.I)
+TAG_RE = re.compile(r"^(?:(?:LSICR|PICR|TICR|TA|TLP|RLS|CP|PT|TT|XV|DP|QI?CR|CI?CR|MFM)[A-Z0-9_-]*|CV[45](?:WICR|TT|PT|AG)-01)$", re.I)
+TAG_TOKEN_RE = re.compile(r"(?:CV[45](?:WICR|TT|PT|AG)-01|(?:LSICR|PICR|TICR|TA|TLP|RLS|CP|PT|TT|XV|DP|QICR|CICR|MFM)[A-Z0-9_-]*)", re.I)
 
 
 # HMI tag naming derived from the supplied Octreotide Skid HMI screens.
@@ -252,6 +253,16 @@ HMI_TAG_MAP = {
     "Agit_Rpm": ("OMCA ANFDA drying system", "Agitator speed", "RPM"),
     "Agit_Pos": ("OMCA ANFDA drying system", "Agitator axial position", "mm"),
 }
+
+# Legacy CV-04 / CV-05 process-report tags
+HMI_TAG_MAP.update({
+    "CV4WICR-01": ("CV-04 Vessel", "Vessel weight", "Kg"),
+    "CV4TT-01": ("CV-04 Vessel", "Vessel temperature", "°C"),
+    "CV4PT-01": ("CV-04 Vessel", "Vessel pressure", "bar"),
+    "CV5WICR-01": ("CV-05 Vessel", "Vessel weight", "Kg"),
+    "CV5TT-01": ("CV-05 Vessel", "Vessel temperature", "°C"),
+    "CV5PT-01": ("CV-05 Vessel", "Vessel pressure", "bar"),
+})
 
 FLOW_SOURCE_TAGS = {
     "LSICR001": "MV-01 Polymer Mixing Tank",
@@ -511,6 +522,74 @@ def parse_process_report(pages):
     if not long_df.empty:
         long_df["Step status"]=long_df["Step status"].fillna("").astype(str).str.strip()
     return wide,long_df,pd.DataFrame(events),pd.DataFrame(alarms)
+
+def extract_pdf_pages_ocr(raw: bytes, first_page=1, last_page=None):
+    """OCR selected pages for scanned legacy process reports using Poppler + Tesseract."""
+    started=time.perf_counter()
+    if not shutil.which("pdftoppm") or not shutil.which("tesseract"):
+        raise RuntimeError("Legacy scanned-report OCR requires pdftoppm and tesseract on the host.")
+    with tempfile.TemporaryDirectory() as tmp:
+        pdf_path=os.path.join(tmp,"input.pdf")
+        with open(pdf_path,"wb") as f: f.write(raw)
+        cmd=["pdftoppm","-f",str(max(1,int(first_page))),"-r","200","-png",pdf_path,os.path.join(tmp,"page")]
+        if last_page: cmd[2:2]=["-l",str(max(int(first_page),int(last_page)))]
+        subprocess.run(cmd,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,timeout=600,check=True)
+        images=sorted(Path(tmp).glob("page-*.png"))
+        pages=[]
+        for img in images:
+            osd=subprocess.run(["tesseract",str(img),"stdout","--psm","0"],capture_output=True,text=True,timeout=45)
+            m=re.search(r"Rotate:\s*(\d+)",osd.stdout); angle=int(m.group(1)) if m else 0
+            source=img
+            if angle and shutil.which("magick"):
+                rotated=img.with_name(img.stem+"_rot.png")
+                subprocess.run(["magick",str(img),"-rotate",str(angle),str(rotated)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=45)
+                source=rotated
+            result=subprocess.run(["tesseract",str(source),"stdout","-l","eng","--psm","4"],capture_output=True,text=True,timeout=90)
+            pages.append(result.stdout or "")
+        return pages,"Poppler + Tesseract OCR",time.perf_counter()-started
+
+def parse_legacy_cv_report(pages, source_page_offset=0):
+    """Parse CV4/CV5 landscape PROCESS REPORT tables and retain only requested tags."""
+    target={"CV4WICR-01","CV4TT-01","CV4PT-01","CV5WICR-01","CV5TT-01","CV5PT-01"}
+    long_rows=[]; groups={}; inventory=[]
+    row_re=re.compile(r"^(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2}:\d{2})\s+(.+)$")
+    for local_page,text in enumerate(pages,1):
+        source_page=source_page_offset+local_page
+        lines=[" ".join(x.split()) for x in text.splitlines() if x.strip()]
+        tags=[]; locations=[]; parameters=[]; units=[]
+        for line in lines:
+            if line.upper().startswith("TAG "):
+                raw_tags=re.findall(r"CV[45](?:WICR|TT|PT|AG)-0?1",line.upper().replace("CVSWICR","CV5WICR").replace("CVSTT","CV5TT").replace("CVSPT","CV5PT").replace("CVATT","CV4TT"))
+                tags=[x[:-1]+"01" if x.endswith("-1") else x for x in raw_tags]
+            elif line.upper().startswith("LOCATION "): locations=line.split()[1:]
+            elif line.upper().startswith("PARAMETER "): parameters=line.split()[1:]
+            elif line.upper().startswith("UNIT "): units=line.split()[1:]
+        if not tags: continue
+        for i,tag in enumerate(tags):
+            if tag in target:
+                inventory.append({"Raw report tag":tag,"Canonical tag":tag,"Section":"Process Report","Header page":source_page})
+        group_name=" + ".join([t for t in tags if t in target])
+        wide=[]
+        for raw in lines:
+            m=row_re.match(raw)
+            if not m: continue
+            tokens=m.group(3).split()
+            if len(tokens)<len(tags) or not all(NUMBER_RE.match(x) for x in tokens[:len(tags)]): continue
+            dt=pd.to_datetime(m.group(1)+" "+m.group(2),dayfirst=True,errors="coerce")
+            if pd.isna(dt): continue
+            status=clean_text(" ".join(tokens[len(tags):])) or "STATUS NOT CAPTURED"
+            wrow={"Date time":dt,"Status":status,"Source page":source_page}
+            for idx,(tag,value) in enumerate(zip(tags,tokens[:len(tags)])):
+                if tag not in target: continue
+                val=float(value); unit=units[idx] if idx<len(units) else HMI_TAG_MAP.get(tag,("","",""))[2]
+                wrow[tag]=val
+                long_rows.append({"Date time":dt,"Instrument tag":tag,"Value":val,"Unit":unit,"Step status":status,"Instrument group":group_name,"Source page":source_page})
+            if len(wrow)>3: wide.append(wrow)
+        if wide: groups[f"Page {source_page}: {group_name}"]=pd.DataFrame(wide)
+    long_df=pd.DataFrame(long_rows)
+    if not long_df.empty: long_df=long_df.sort_values(["Date time","Instrument tag"]).drop_duplicates(["Date time","Instrument tag"],keep="first")
+    inv=pd.DataFrame(inventory).drop_duplicates() if inventory else pd.DataFrame(columns=["Raw report tag","Canonical tag","Section","Header page"])
+    return groups,long_df,pd.DataFrame(),pd.DataFrame(),inv
 
 def detect_report_type(pages):
     """Automatically classify supported PDF layouts using multiple independent markers."""
@@ -1151,6 +1230,21 @@ def show_plot_with_downloads(fig, chart_key, file_stem, height=None):
     )
 
 
+def dataframe_to_excel_bytes(df, sheet_name="Extracted Data"):
+    output=BytesIO()
+    with pd.ExcelWriter(output,engine="openpyxl") as writer:
+        df.to_excel(writer,index=False,sheet_name=sheet_name[:31])
+        ws=writer.book[sheet_name[:31]]
+        ws.freeze_panes="A2"
+        ws.auto_filter.ref=ws.dimensions
+        for cell in ws[1]:
+            cell.font=cell.font.copy(bold=True,color="FFFFFF")
+            cell.fill=cell.fill.copy(fill_type="solid",fgColor="17365D")
+        for column in ws.columns:
+            letter=column[0].column_letter
+            ws.column_dimensions[letter].width=min(55,max(12,max(len(str(c.value or "")) for c in column)+2))
+    return output.getvalue()
+
 def safe_table(df,height=650,max_rows=3000,key=None):
     df=df.copy()
     if isinstance(df.index,pd.MultiIndex):
@@ -1169,7 +1263,7 @@ def safe_table(df,height=650,max_rows=3000,key=None):
     st.dataframe(view,width="stretch",hide_index=True,height=height,row_height=31,key=key)
 
 st.title("Universal ADAM and OMCA ANFDA Multi-Report Extractor")
-st.caption("Build: INTERACTIVE-MULTI-SENSOR-v17 | Selected-step profile highlighting")
+st.caption("Build: INTERACTIVE-MULTI-SENSOR-v18 | Legacy CV4/CV5 OCR + Excel export")
 st.caption("Fast extraction uses Poppler pdftotext, then applies the selected ADAM or OMCA parser. Multiple reports are supported without automatic detection delay.")
 uploads=st.sidebar.file_uploader(
     "Upload multiple report PDFs",
@@ -1202,15 +1296,20 @@ for idx,uploaded in enumerate(uploads):
     default_index=1 if any(x in filename for x in ["drying","trial batch","anfd-2","omca"]) else 0
     report_type_by_file[uploaded.name]=st.sidebar.selectbox(
         uploaded.name,
-        ["ADAM Skid Process Report","OMCA ANFDA Drying Report"],
+        ["ADAM Skid Process Report","OMCA ANFDA Drying Report","Legacy CV4/CV5 Process Report (OCR)"],
         index=default_index,
         key=f"report_type_{idx}_{uploaded.name}_{uploaded.size}",
         help="ADAM: Process Cycle reports with full date/time and multiple LSICR/PICR/TICR groups. OMCA ANFDA: ANFD-2 Drying reports with Record, Time, TT-01, TT-02, PT-01, Filter_Pos, Agit_Rpm and Agit_Pos."
     )
 
+legacy_first_page=st.sidebar.number_input("Legacy OCR start page",min_value=1,value=1,step=1,help="Used only for Legacy CV4/CV5 Process Report.")
+legacy_last_page=st.sidebar.number_input("Legacy OCR end page",min_value=1,value=316,step=1,help="Use the internal PDF page numbers, for example 196-237 or 275-316.")
 @st.cache_data(show_spinner=False, max_entries=2, ttl=1800)
-def process_uploaded_report(file_name, raw, selected_type, parser_version="interactive-multi-sensor-v9"):
-    pages,extraction_engine,text_extraction_seconds=extract_pdf_pages(raw)
+def process_uploaded_report(file_name, raw, selected_type, first_page=1, last_page=None, parser_version="legacy-cv-v1"):
+    if selected_type=="Legacy CV4/CV5 Process Report (OCR)":
+        pages,extraction_engine,text_extraction_seconds=extract_pdf_pages_ocr(raw,first_page,last_page)
+    else:
+        pages,extraction_engine,text_extraction_seconds=extract_pdf_pages(raw)
     tag_inventory=scan_report_tag_headers(pages)
     detected_type=selected_type
     adam_score=0; omca_score=0
@@ -1221,6 +1320,8 @@ def process_uploaded_report(file_name, raw, selected_type, parser_version="inter
         groups,long_df,events,alarms=parse_process_report(pages)
     elif selected_type=="OMCA ANFDA Drying Report":
         groups,long_df,events,alarms=parse_omca_anfd_report(pages)
+    elif selected_type=="Legacy CV4/CV5 Process Report (OCR)":
+        groups,long_df,events,alarms,tag_inventory=parse_legacy_cv_report(pages,int(first_page)-1)
     else:
         error="Select a valid report type."
     meta["File name"]=file_name
@@ -1257,7 +1358,7 @@ if process_now:
         selected_type=report_type_by_file[uploaded.name]
         progress.progress(i/len(uploads),text=f"Extracting {uploaded.name} as {selected_type} ({i+1} of {len(uploads)})")
         try:
-            reports.append(process_uploaded_report(uploaded.name,uploaded.getvalue(),selected_type,"interactive-multi-sensor-v9"))
+            reports.append(process_uploaded_report(uploaded.name,uploaded.getvalue(),selected_type,int(legacy_first_page),int(legacy_last_page),"legacy-cv-v1"))
         except Exception as exc:
             reports.append({"file_name":uploaded.name,"detected_type":"Failed","error":str(exc),"long_df":pd.DataFrame(),"events":pd.DataFrame(),"alarms":pd.DataFrame(),"groups":{},"meta":{"File name":uploaded.name},"adam_score":0,"omca_score":0})
         gc.collect()
@@ -1903,6 +2004,7 @@ with tabs[7]:
     view=long_df
     if search: view=view[view.astype(str).apply(lambda x:x.str.contains(search,case=False,na=False)).any(axis=1)]
     safe_table(view)
+    st.download_button("Download extracted data as Excel",data=dataframe_to_excel_bytes(view),file_name=f"{Path(active_name).stem}_tagwise_extraction.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",width="stretch",key=f"excel_export_{active_name}")
 with tabs[8]:
     a,b=st.columns(2)
     with a:
