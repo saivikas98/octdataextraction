@@ -22,7 +22,7 @@ from pathlib import Path
 
 
 def clear_application_cache():
-    """Clear parsed-report caches and temporary selection state."""
+    \"\"\"Clear parsed-report caches and temporary selection state.\"\"\"
     st.cache_data.clear()
     st.cache_resource.clear()
     for key in list(st.session_state.keys()):
@@ -310,7 +310,7 @@ def infer_destination(status):
     return " -> ".join(hits[-2:]) if hits else "Destination not explicit in step status"
 
 def calculate_interval_flowrates(long_df, smoothing_points=3):
-    """Calculate mass flow for each consecutive valid load-cell interval, without averaging."""
+    \"\"\"Calculate mass flow for each consecutive valid load-cell interval, without averaging.\"\"\"
     if long_df is None or long_df.empty:
         return pd.DataFrame()
     work=long_df[long_df["Instrument tag"].isin(FLOW_SOURCE_TAGS)].copy()
@@ -338,7 +338,7 @@ def calculate_interval_flowrates(long_df, smoothing_points=3):
     return pd.concat(parts,ignore_index=True) if parts else pd.DataFrame()
 
 def add_hmi_tag_names(df):
-    """Add HMI names without tuple mapping or MultiIndex construction."""
+    \"\"\"Add HMI names without tuple mapping or MultiIndex construction.\"\"\"
     if df is None or df.empty or "Instrument tag" not in df.columns:
         return df
     out=df.copy()
@@ -370,7 +370,7 @@ def add_hmi_tag_names(df):
     return out
 
 def extract_pdf_pages(raw: bytes):
-    """Fast PDF text extraction using Poppler, with pdfplumber fallback."""
+    \"\"\"Fast PDF text extraction using Poppler, with pdfplumber fallback.\"\"\"
     started=time.perf_counter()
     try:
         with tempfile.TemporaryDirectory() as tmp:
@@ -433,7 +433,7 @@ def canonical_tag(tag):
     return TAG_ALIASES.get(raw.upper(),raw.upper())
 
 def scan_report_tag_headers(pages):
-    """Inventory every tag printed in cycle/event headers, even if no data row is parsed."""
+    \"\"\"Inventory every tag printed in cycle/event headers, even if no data row is parsed.\"\"\"
     found=[]
     for page_no,text in enumerate(pages,1):
         lines=text.splitlines()
@@ -453,7 +453,7 @@ def scan_report_tag_headers(pages):
     return pd.DataFrame(found).drop_duplicates() if found else pd.DataFrame(columns=["Raw report tag","Canonical tag","Section","Header page"])
 
 def header_tags(page_text):
-    """Extract every tag token from the current page header without relying on spacing."""
+    \"\"\"Extract every tag token from the current page header without relying on spacing.\"\"\"
     lines=page_text.splitlines()
     tags=[]; units={}; record_type=None
     for line in lines:
@@ -529,7 +529,7 @@ def parse_process_report(pages):
     return wide,long_df,pd.DataFrame(events),pd.DataFrame(alarms)
 
 def repair_missing_decimal_points(long_df, user_corrections=None):
-    """Repair clear OCR decimal-loss outliers and apply user manual corrections.
+    \"\"\"Repair clear OCR decimal-loss outliers and apply user manual corrections.
     
     The current reading is excluded from the local reference. Decimal candidates
     value/10, value/100 and value/1000 are tested. A change is accepted only
@@ -537,7 +537,7 @@ def repair_missing_decimal_points(long_df, user_corrections=None):
     the local error by at least 90%. Weight/load-cell readings are excluded.
     
     Any provided user corrections are applied sequentially.
-    """
+    \"\"\"
     if long_df is None or long_df.empty or "Value" not in long_df.columns:
         return long_df
     out=long_df.copy()
@@ -583,7 +583,7 @@ def repair_missing_decimal_points(long_df, user_corrections=None):
                 out.at[row_i,"OCR decimal repaired"]=True
 
     # 2. Apply explicit user manual corrections if provided
-    if user_corrections:
+    if user_corrections is not None:
         for idx, row in user_corrections.iterrows():
             mask = (out["Date time"] == row["Date time"]) & (out["Instrument tag"] == row["Instrument tag"]) & (out["Source report"] == row["Source report"])
             if mask.any():
@@ -593,7 +593,7 @@ def repair_missing_decimal_points(long_df, user_corrections=None):
     return out
 
 def extract_pdf_pages_ocr(raw: bytes, first_page=1, last_page=None):
-    """Low-CPU, single-pass, page-at-a-time OCR for scanned legacy reports."""
+    \"\"\"Low-CPU, single-pass, page-at-a-time OCR for scanned legacy reports.\"\"\"
     started=time.perf_counter()
     if not shutil.which("pdftoppm") or not shutil.which("tesseract"):
         raise RuntimeError("Legacy OCR requires poppler-utils and tesseract-ocr in packages.txt.")
@@ -662,7 +662,7 @@ def correct_legacy_step_name(value):
     return LEGACY_STEP_NAME_MAP.get(upper,cleaned.strip(" |.,"))
 
 def parse_legacy_cv_report(pages, source_page_offset=0):
-    """Parse scanned CV4/CV5 process tables while preserving every source-column position."""
+    \"\"\"Parse scanned CV4/CV5 process tables while preserving every source-column position.\"\"\"
     target={"CV4WICR-01","CV4TT-01","CV4PT-01","CV5WICR-01","CV5TT-01","CV5PT-01"}
     unit_map={"WICR":"Kg","TT":"°C","PT":"bar","AG":"rpm"}
     long_rows=[]; groups={}; inventory=[]
@@ -732,7 +732,7 @@ def parse_legacy_cv_report(pages, source_page_offset=0):
     return groups,long_df,pd.DataFrame(),pd.DataFrame(),inv
 
 def detect_report_type(pages):
-    """Automatically classify supported PDF layouts using multiple independent markers."""
+    \"\"\"Automatically classify supported PDF layouts using multiple independent markers.\"\"\"
     probe="\n".join(pages[:6])
     normalized=re.sub(r"\s+", " ", probe).upper()
 
@@ -760,7 +760,7 @@ def detect_report_type(pages):
     return "Unknown", adam_score, omca_score, adam_markers, omca_markers
 
 def parse_omca_anfd_report(pages):
-    """Parse OMCA ANFDA/ANFD-2 reports with sequence + time-only rows."""
+    \"\"\"Parse OMCA ANFDA/ANFD-2 reports with sequence + time-only rows.\"\"\"
     text="\n".join(pages[:3])
     start_match=re.search(r"START DATE\s*&?TIME\s*:?\s*(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2}:\d{2})",text,re.I)
     if not start_match:
@@ -801,7 +801,7 @@ def parse_omca_anfd_report(pages):
 
 
 def build_cross_batch_wide(valid_reports):
-    """Reconstruct one wide process table per uploaded report."""
+    \"\"\"Reconstruct one wide process table per uploaded report.\"\"\"
     frames = []
     for item in valid_reports:
         d = item.get("long_df", pd.DataFrame()).copy()
@@ -823,7 +823,7 @@ def build_cross_batch_wide(valid_reports):
 
 
 def make_step_elapsed_profile(wide_df, selected_steps):
-    """Align every contiguous step occurrence at elapsed time zero."""
+    \"\"\"Align every contiguous step occurrence at elapsed time zero.\"\"\"
     parts = []
     for report, g in wide_df.groupby("Source report", sort=False):
         g = g.sort_values("Date time").copy()
@@ -841,11 +841,11 @@ def make_step_elapsed_profile(wide_df, selected_steps):
     return pd.concat(parts, ignore_index=True, sort=False) if parts else pd.DataFrame()
 
 def identify_process_sequences(data, start_step, end_step, max_duration_minutes=180):
-    """Pair each start-step occurrence with the next end-step occurrence.
+    \"\"\"Pair each start-step occurrence with the next end-step occurrence.
 
     The returned rows include every process status between the two boundaries,
     which creates the requested continuous profile rather than sparse selected-step lines.
-    """
+    \"\"\"
     d=data.sort_values("Date time").copy()
     if d.empty:
         return []
@@ -880,7 +880,7 @@ def identify_process_sequences(data, start_step, end_step, max_duration_minutes=
     return sequences
 
 def identify_profile_windows(data, selected_steps, gap_minutes=10):
-    """Split matching process records into contiguous chronological windows."""
+    \"\"\"Split matching process records into contiguous chronological windows.\"\"\"
     d=data[data["Step status"].astype(str).isin(selected_steps)].sort_values("Date time").copy()
     if d.empty:
         return d, []
@@ -901,7 +901,7 @@ def identify_profile_windows(data, selected_steps, gap_minutes=10):
     return d,options
 
 def normalize_step_name(value):
-    """Normalize report step names so hyphens/spaces do not prevent matching."""
+    \"\"\"Normalize report step names so hyphens/spaces do not prevent matching.\"\"\"
     return re.sub(r"[^A-Z0-9]+", "", str(value or "").upper())
 
 
@@ -916,12 +916,12 @@ def add_target_step_highlight(
     band_opacity=0.12,
     show_band=True,
 ):
-    """Overlay a bold line and optional vertical band for one process step.
+    \"\"\"Overlay a bold line and optional vertical band for one process step.
 
     A separate highlighted segment is drawn for every batch and selected sensor.
     This is suitable for cross-batch plots because each batch can enter the
     target step at a different elapsed time.
-    """
+    \"\"\"
     if profile is None or profile.empty or not target_step:
         return fig
     required={"Batch","Step status",x_column}
@@ -989,11 +989,11 @@ def add_target_step_highlight(
     return fig
 
 def build_multi_sensor_profile(profile, tags, title=None, y_ranges=None, highlight_step=None, highlight_color="#FFC000", highlight_opacity=0.12, show_highlight_band=True):
-    """Overlay multiple selected sensors in one interactive graph.
+    \"\"\"Overlay multiple selected sensors in one interactive graph.
 
     Sensors are assigned to separate Y-axis families so weight, temperature,
     and pressure can be viewed together without forcing a common scale.
-    """
+    \"\"\"
     if profile.empty or not tags:
         return go.Figure()
     y_ranges=y_ranges or {}
@@ -1145,7 +1145,7 @@ def build_multi_sensor_profile(profile, tags, title=None, y_ranges=None, highlig
     return fig
 
 def build_cross_batch_sensor_profile(profile, tags, title, y_ranges=None, highlight_step=None, highlight_color="#FFC000", highlight_opacity=0.12, show_highlight_band=True):
-    """Overlay selected batches with elapsed minutes below and actual date/time above."""
+    \"\"\"Overlay selected batches with elapsed minutes below and actual date/time above.\"\"\"
     if profile.empty or not tags:
         return go.Figure()
     y_ranges=y_ranges or {}
@@ -1216,7 +1216,7 @@ def build_cross_batch_sensor_profile(profile, tags, title, y_ranges=None, highli
     return fig
 
 def build_single_sensor_profile(profile, tag, title=None, y_range=None, highlight_step=None, highlight_color="#FFC000", highlight_opacity=0.12, show_highlight_band=True):
-    """Plot one sensor from sequence start to end with process-step highlighting."""
+    \"\"\"Plot one sensor from sequence start to end with process-step highlighting.\"\"\"
     if profile.empty or tag not in profile.columns:
         return go.Figure()
     d=profile.sort_values("Date time").copy()
@@ -1303,7 +1303,7 @@ def build_single_sensor_profile(profile, tag, title=None, y_range=None, highligh
 
 
 def apply_plot_font_sizes(fig):
-    """Apply sidebar-selected font sizes to every Plotly chart."""
+    \"\"\"Apply sidebar-selected font sizes to every Plotly chart.\"\"\"
     fig.update_layout(
         font=dict(size=plot_tick_font),
         title_font=dict(size=plot_title_font),
@@ -1315,7 +1315,7 @@ def apply_plot_font_sizes(fig):
     return fig
 
 def apply_editable_axis_titles(fig, plot_title, bottom_x_title, top_x_title, family_titles, legend_title=None):
-    """Apply user-entered titles to existing Plotly axes without changing data."""
+    \"\"\"Apply user-entered titles to existing Plotly axes without changing data.\"\"\"
     fig.update_layout(title_text=plot_title)
     fig.update_xaxes(title_text=bottom_x_title, row=None, col=None)
     if "xaxis2" in fig.layout:
@@ -1336,16 +1336,27 @@ def apply_editable_axis_titles(fig, plot_title, bottom_x_title, top_x_title, fam
     return fig
 
 def show_plot_with_downloads(fig, chart_key, file_stem, height=None):
-    """Display a Plotly chart with browser-side PNG and HTML downloads.
+    \"\"\"Display a Plotly chart with browser-side PNG and HTML downloads.
 
     PNG uses Plotly's camera button in the chart toolbar. This runs in the
     user's browser and does not require Kaleido, Chrome, or server memory.
-    """
+    \"\"\"
     if height:
         fig.update_layout(height=height)
     fig=apply_plot_font_sizes(fig)
     safe_name=re.sub(r"[^A-Za-z0-9_-]+", "_", str(file_stem)).strip("_") or "plot"
+    
+    # NEW CONFIG ADDITION: Interactive direct HTML editing for Title, Axes, and Legends
     plot_config={
+        "editable": True,
+        "edits": {
+            "titleText": True,
+            "axisTitleText": True,
+            "legendText": True,
+            "legendPosition": True,
+            "annotationText": True,
+            "colorbarTitleText": True
+        },
         "displaylogo": False,
         "responsive": True,
         "scrollZoom": True,
@@ -1361,7 +1372,7 @@ def show_plot_with_downloads(fig, chart_key, file_stem, height=None):
         },
     }
     st.plotly_chart(fig, width="stretch", key=chart_key, config=plot_config)
-    st.caption("Interactive: hover for values, drag to zoom, mouse wheel to zoom, double-click to reset, use the 10m/30m/1h/All buttons. Camera icon downloads PNG.")
+    st.caption("Interactive: hover for values, drag to zoom, mouse wheel to zoom, double-click to reset. **Click on titles, axis labels, or legend names to edit them directly.** Camera icon downloads PNG.")
     html_bytes=fig.to_html(full_html=True, include_plotlyjs=True, config=plot_config).encode("utf-8")
     st.download_button(
         "Download interactive HTML",
@@ -1979,19 +1990,21 @@ with tabs[2]:
                 default_max=observed_max+0.05*span
                 yc1,yc2,yc3=st.columns([1.2,1,1])
                 with yc1:
-                    st.write(f"**{axis_tag}**Observed: {observed_min:.3f} to {observed_max:.3f}")
+                    st.write(f"**{axis_tag}**  \nObserved: {observed_min:.3f} to {observed_max:.3f}")
                 with yc2:
                     selected_y_min=st.number_input(
                         f"{axis_tag} minimum",
                         value=float(default_min),
                         format="%.3f",
-                        key=f"y_min_{axis_tag}_v12",)
+                        key=f"y_min_{axis_tag}_v12",
+                    )
                 with yc3:
                     selected_y_max=st.number_input(
                         f"{axis_tag} maximum",
                         value=float(default_max),
                         format="%.3f",
-                        key=f"y_max_{axis_tag}_v12",)
+                        key=f"y_max_{axis_tag}_v12",
+                    )
                 if selected_y_max<=selected_y_min:
                     st.warning(f"{axis_tag}: maximum must be greater than minimum. Automatic scaling will be used for this tag.")
                 else:
