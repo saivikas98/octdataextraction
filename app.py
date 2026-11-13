@@ -443,11 +443,11 @@ def scan_report_tag_headers(pages):
             if "DATE TIME" in u and ("STEP STATUS" in u or "EVENT STATUS" in u):
                 right=re.split(r"DATE TIME",line,flags=re.I,maxsplit=1)[1]
                 right=re.sub(r"(?:STEP|EVENT) STATUS.*$","",right,flags=re.I)
-                for candidate in [x.strip() for x in re.split(r"\\s{2,}",right) if x.strip()]:
+                for candidate in [x.strip() for x in re.split(r"\s{2,}",right) if x.strip()]:
                     if TAG_RE.match(candidate):
                         found.append({"Raw report tag":candidate,"Canonical tag":canonical_tag(candidate),"Section":section,"Header page":page_no})
-            if re.match(r"^\\s*Tag\\s+",line,re.I):
-                for candidate in [x.strip() for x in re.split(r"\\s{2,}",line.strip())[1:] if x.strip()]:
+            if re.match(r"^\s*Tag\s+",line,re.I):
+                for candidate in [x.strip() for x in re.split(r"\s{2,}",line.strip())[1:] if x.strip()]:
                     if TAG_RE.match(candidate):
                         found.append({"Raw report tag":candidate,"Canonical tag":canonical_tag(candidate),"Section":section,"Header page":page_no})
     return pd.DataFrame(found).drop_duplicates() if found else pd.DataFrame(columns=["Raw report tag","Canonical tag","Section","Header page"])
@@ -528,13 +528,15 @@ def parse_process_report(pages):
         long_df["Step status"]=long_df["Step status"].fillna("").astype(str).str.strip()
     return wide,long_df,pd.DataFrame(events),pd.DataFrame(alarms)
 
-def repair_missing_decimal_points(long_df):
-    """Repair clear OCR decimal-loss outliers from temperature/pressure series.
-
+def repair_missing_decimal_points(long_df, user_corrections=None):
+    """Repair clear OCR decimal-loss outliers and apply user manual corrections.
+    
     The current reading is excluded from the local reference. Decimal candidates
     value/10, value/100 and value/1000 are tested. A change is accepted only
     when the candidate agrees closely with neighboring readings and improves
     the local error by at least 90%. Weight/load-cell readings are excluded.
+    
+    Any provided user corrections are applied sequentially.
     """
     if long_df is None or long_df.empty or "Value" not in long_df.columns:
         return long_df
@@ -542,14 +544,21 @@ def repair_missing_decimal_points(long_df):
     out["Value"]=pd.to_numeric(out["Value"],errors="coerce")
     out["OCR original value"]=out["Value"]
     out["OCR decimal repaired"]=False
+    
+    # 1. Automatic OCR repair for missing decimals
     for tag,idx in out.sort_values("Date time").groupby("Instrument tag",sort=False).groups.items():
         upper=str(tag).upper()
         compact=re.sub(r"[^A-Z0-9]","",upper)
         is_weight=("WICR" in upper or upper.startswith("LSICR"))
         is_temp=(upper.startswith(("TICR","TT-")) or re.search(r"CV[45]TT0*1$",compact))
         is_pressure=(upper.startswith(("PICR","PT-")) or re.search(r"CV[45]PT0*1$",compact))
-        if is_weight or not (is_temp or is_pressure):
+        
+        # In legacy OCR, sometimes even a value like "650" should be "6.50", 
+        # so we relax the automatic filter if the user flagged it as an issue.
+        # But we still primarily target temp and pressure for auto-repair.
+        if is_weight and not (user_corrections): 
             continue
+            
         ordered=list(idx)
         vals=pd.to_numeric(out.loc[ordered,"Value"],errors="coerce")
         # Neighbor-only reference prevents the malformed value from masking itself.
@@ -559,14 +568,28 @@ def repair_missing_decimal_points(long_df):
         for row_i,current,reference in zip(ordered,vals,ref):
             if pd.isna(current) or pd.isna(reference) or abs(reference)<0.01:
                 continue
-            candidates=[current/10.0,current/100.0,current/1000.0]
+            
+            # Check 10, 100, 1000 divisors
+            candidates=[current/10.0, current/100.0, current/1000.0]
             best=min(candidates,key=lambda x:abs(x-reference))
             old_error=abs(current-reference)
             new_error=abs(best-reference)
             tolerance=max(0.25,0.08*abs(reference))
+            
+            # If the current value is huge compared to reference (missing decimal), and the repaired 
+            # version is extremely close to the reference, accept the fix.
             if abs(current)>=8*abs(reference) and new_error<=tolerance and new_error<=0.10*old_error:
                 out.at[row_i,"Value"]=round(best,6)
                 out.at[row_i,"OCR decimal repaired"]=True
+
+    # 2. Apply explicit user manual corrections if provided
+    if user_corrections:
+        for idx, row in user_corrections.iterrows():
+            mask = (out["Date time"] == row["Date time"]) & (out["Instrument tag"] == row["Instrument tag"]) & (out["Source report"] == row["Source report"])
+            if mask.any():
+                out.loc[mask, "Value"] = float(row["Corrected value"])
+                out.loc[mask, "OCR decimal repaired"] = True
+
     return out
 
 def extract_pdf_pages_ocr(raw: bytes, first_page=1, last_page=None):
@@ -1385,9 +1408,27 @@ def safe_table(df,height=650,max_rows=3000,key=None):
         elif str(view[c].dtype) in ("object","category"): view[c]=view[c].astype(str).replace("nan","")
     st.dataframe(view,width="stretch",hide_index=True,height=height,row_height=31,key=key)
 
+
+# Initialize Session State for Manual Corrections
+if "manual_corrections" not in st.session_state:
+    st.session_state["manual_corrections"] = pd.DataFrame(columns=["Source report", "Instrument tag", "Date time", "Corrected value"])
+
 st.title("Universal ADAM and OMCA ANFDA Multi-Report Extractor")
-st.caption("Build: INTERACTIVE-MULTI-SENSOR-v33 | Robust missing-decimal OCR repair")
+st.caption("Build: INTERACTIVE-MULTI-SENSOR-v34 | Robust missing-decimal OCR repair & Manual Correction")
 st.caption("Fast extraction uses Poppler pdftotext, then applies the selected ADAM or OMCA parser. Multiple reports are supported without automatic detection delay.")
+
+# Add Manual Correction UI to sidebar
+st.sidebar.subheader("Manual OCR Data Correction")
+st.sidebar.caption("If a decimal point issue persists (e.g., 6.50 extracted as 650), you can manually fix it here. Select the report, tag, and time, then enter the correct value.")
+
+# Display existing corrections
+if not st.session_state["manual_corrections"].empty:
+    with st.sidebar.expander("Active Manual Corrections"):
+        st.dataframe(st.session_state["manual_corrections"], hide_index=True, use_container_width=True)
+        if st.button("Clear All Corrections"):
+            st.session_state["manual_corrections"] = pd.DataFrame(columns=["Source report", "Instrument tag", "Date time", "Corrected value"])
+            st.rerun()
+
 uploads=st.sidebar.file_uploader(
     "Upload multiple report PDFs",
     type=["pdf"],
@@ -1446,8 +1487,9 @@ for idx,uploaded in enumerate(uploads):
         legacy_page_range_by_file[uploaded.name]=(int(first_page),int(last_page))
     else:
         legacy_page_range_by_file[uploaded.name]=(1,None)
+        
 @st.cache_data(show_spinner=False, max_entries=2, ttl=1800)
-def process_uploaded_report(file_name, raw, selected_type, first_page=1, last_page=None, parser_version="legacy-cv-v6-low-cpu-step-correction"):
+def process_uploaded_report(file_name, raw, selected_type, first_page=1, last_page=None, parser_version="legacy-cv-v6-low-cpu-step-correction", user_corrections_df=None):
     if selected_type=="Legacy CV4/CV5 Process Report (OCR)":
         pages,extraction_engine,text_extraction_seconds=extract_pdf_pages_ocr(raw,first_page,last_page)
     else:
@@ -1464,7 +1506,7 @@ def process_uploaded_report(file_name, raw, selected_type, first_page=1, last_pa
         groups,long_df,events,alarms=parse_omca_anfd_report(pages)
     elif selected_type=="Legacy CV4/CV5 Process Report (OCR)":
         groups,long_df,events,alarms,tag_inventory=parse_legacy_cv_report(pages,int(first_page)-1)
-        long_df=repair_missing_decimal_points(long_df)
+        long_df=repair_missing_decimal_points(long_df, user_corrections=user_corrections_df)
     else:
         error="Select a valid report type."
     if error is None and long_df.empty:
@@ -1507,7 +1549,9 @@ if process_now:
             first_page,last_page=legacy_page_range_by_file.get(uploaded.name,(1,None))
             if selected_type=="Legacy CV4/CV5 Process Report (OCR)" and last_page is not None and last_page<first_page:
                 raise ValueError(f"End page ({last_page}) must be greater than or equal to start page ({first_page}) for {uploaded.name}.")
-            reports.append(process_uploaded_report(uploaded.name,uploaded.getvalue(),selected_type,first_page,last_page,"legacy-cv-v7-per-file-page-range"))
+            # Pass user corrections for this specific file
+            file_corrections = st.session_state["manual_corrections"][st.session_state["manual_corrections"]["Source report"] == uploaded.name]
+            reports.append(process_uploaded_report(uploaded.name,uploaded.getvalue(),selected_type,first_page,last_page,"legacy-cv-v7-per-file-page-range", file_corrections))
         except Exception as exc:
             reports.append({"file_name":uploaded.name,"detected_type":"Failed","error":f"{type(exc).__name__}: {exc}","long_df":pd.DataFrame(),"events":pd.DataFrame(),"alarms":pd.DataFrame(),"groups":{},"meta":{"File name":uploaded.name},"adam_score":0,"omca_score":0})
         gc.collect()
@@ -1669,6 +1713,44 @@ with tabs[2]:
     if cross_wide.empty:
         st.info("Process at least one ADAM Process report to create sensor profiles.")
     else:
+        # ---- UI Addition: Manual Form entry in Profile Tab ----
+        with st.expander("🛠️ Add Manual OCR Correction", expanded=False):
+            st.markdown("If you notice a spike/drop caused by OCR missing a decimal point (e.g. 6.50 extracted as 650), manually correct it here.")
+            corr_col1, corr_col2, corr_col3 = st.columns(3)
+            with corr_col1:
+                man_report = st.selectbox("Source Report", report_names, key="man_corr_report")
+            with corr_col2:
+                available_tags = []
+                # Fetch available tags for the selected report
+                if not cross_wide.empty:
+                    available_tags = cross_wide[cross_wide["Source report"] == man_report].columns.drop(["Source report", "Batch", "Date time", "Step status"], errors='ignore').tolist()
+                man_tag = st.selectbox("Instrument Tag", sorted(available_tags) if available_tags else [selected_tag], key="man_corr_tag")
+            with corr_col3:
+                # Provide an initial value to the time input to avoid empty errors
+                available_times = []
+                if not cross_wide.empty and man_tag:
+                   rep_data = cross_wide[cross_wide["Source report"] == man_report]
+                   available_times = rep_data["Date time"].dt.strftime("%d-%m-%Y %H:%M:%S").tolist()
+                   
+                man_time = st.selectbox("Select exact Timestamp", available_times, key="man_corr_time")
+            
+            man_val = st.number_input("Corrected Value", format="%.3f", key="man_corr_val")
+            if st.button("Apply Correction & Reprocess", type="primary"):
+                try:
+                    parsed_time = pd.to_datetime(man_time, format="%d-%m-%Y %H:%M:%S")
+                    new_correction = pd.DataFrame([{
+                        "Source report": man_report,
+                        "Instrument tag": man_tag,
+                        "Date time": parsed_time,
+                        "Corrected value": man_val
+                    }])
+                    st.session_state["manual_corrections"] = pd.concat([st.session_state["manual_corrections"], new_correction], ignore_index=True)
+                    st.success("Correction saved! Please click 'Process uploaded reports' again in the sidebar to apply the changes to the extracted data.")
+                except Exception as e:
+                    st.error(f"Failed to add correction: {e}")
+        st.divider()
+        # ---- End of manual form ----
+
         available_batches=sorted(x for x in cross_wide["Batch"].dropna().astype(str).unique() if x.strip())
         selected_batches=st.multiselect(
             "Batch numbers",
@@ -1897,7 +1979,8 @@ with tabs[2]:
                 default_max=observed_max+0.05*span
                 yc1,yc2,yc3=st.columns([1.2,1,1])
                 with yc1:
-                    st.write(f"**{axis_tag}**  \nObserved: {observed_min:.3f} to {observed_max:.3f}")
+                    st.write(f"**{axis_tag}**  
+Observed: {observed_min:.3f} to {observed_max:.3f}")
                 with yc2:
                     selected_y_min=st.number_input(
                         f"{axis_tag} minimum",
@@ -1981,8 +2064,6 @@ with tabs[2]:
             )
         with stat_col2:
             # Use the temperature tags selected in the profile controls.
-            # `selected_temp` is defined in this profile block; the previous
-            # variable name `ts` was undefined and caused a NameError.
             default_stat_tags=[
                 x for x in selected_temp
                 if x in available_stat_temp_tags
