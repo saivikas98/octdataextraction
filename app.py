@@ -22,7 +22,7 @@ from pathlib import Path
 
 
 def clear_application_cache():
-    """Clear parsed-report caches and temporary selection state."""
+    \"\"\"Clear parsed-report caches and temporary selection state.\"\"\"
     st.cache_data.clear()
     st.cache_resource.clear()
     for key in list(st.session_state.keys()):
@@ -310,7 +310,7 @@ def infer_destination(status):
     return " -> ".join(hits[-2:]) if hits else "Destination not explicit in step status"
 
 def calculate_interval_flowrates(long_df, smoothing_points=3):
-    """Calculate mass flow for each consecutive valid load-cell interval, without averaging."""
+    \"\"\"Calculate mass flow for each consecutive valid load-cell interval, without averaging.\"\"\"
     if long_df is None or long_df.empty:
         return pd.DataFrame()
     work=long_df[long_df["Instrument tag"].isin(FLOW_SOURCE_TAGS)].copy()
@@ -338,7 +338,7 @@ def calculate_interval_flowrates(long_df, smoothing_points=3):
     return pd.concat(parts,ignore_index=True) if parts else pd.DataFrame()
 
 def add_hmi_tag_names(df):
-    """Add HMI names without tuple mapping or MultiIndex construction."""
+    \"\"\"Add HMI names without tuple mapping or MultiIndex construction.\"\"\"
     if df is None or df.empty or "Instrument tag" not in df.columns:
         return df
     out=df.copy()
@@ -370,7 +370,7 @@ def add_hmi_tag_names(df):
     return out
 
 def extract_pdf_pages(raw: bytes):
-    """Fast PDF text extraction using Poppler, with pdfplumber fallback."""
+    \"\"\"Fast PDF text extraction using Poppler, with pdfplumber fallback.\"\"\"
     started=time.perf_counter()
     try:
         with tempfile.TemporaryDirectory() as tmp:
@@ -433,7 +433,7 @@ def canonical_tag(tag):
     return TAG_ALIASES.get(raw.upper(),raw.upper())
 
 def scan_report_tag_headers(pages):
-    """Inventory every tag printed in cycle/event headers, even if no data row is parsed."""
+    \"\"\"Inventory every tag printed in cycle/event headers, even if no data row is parsed.\"\"\"
     found=[]
     for page_no,text in enumerate(pages,1):
         lines=text.splitlines()
@@ -443,17 +443,17 @@ def scan_report_tag_headers(pages):
             if "DATE TIME" in u and ("STEP STATUS" in u or "EVENT STATUS" in u):
                 right=re.split(r"DATE TIME",line,flags=re.I,maxsplit=1)[1]
                 right=re.sub(r"(?:STEP|EVENT) STATUS.*$","",right,flags=re.I)
-                for candidate in [x.strip() for x in re.split(r"\\s{2,}",right) if x.strip()]:
+                for candidate in [x.strip() for x in re.split(r"\s{2,}",right) if x.strip()]:
                     if TAG_RE.match(candidate):
                         found.append({"Raw report tag":candidate,"Canonical tag":canonical_tag(candidate),"Section":section,"Header page":page_no})
-            if re.match(r"^\\s*Tag\\s+",line,re.I):
-                for candidate in [x.strip() for x in re.split(r"\\s{2,}",line.strip())[1:] if x.strip()]:
+            if re.match(r"^\s*Tag\s+",line,re.I):
+                for candidate in [x.strip() for x in re.split(r"\s{2,}",line.strip())[1:] if x.strip()]:
                     if TAG_RE.match(candidate):
                         found.append({"Raw report tag":candidate,"Canonical tag":canonical_tag(candidate),"Section":section,"Header page":page_no})
     return pd.DataFrame(found).drop_duplicates() if found else pd.DataFrame(columns=["Raw report tag","Canonical tag","Section","Header page"])
 
 def header_tags(page_text):
-    """Extract every tag token from the current page header without relying on spacing."""
+    \"\"\"Extract every tag token from the current page header without relying on spacing.\"\"\"
     lines=page_text.splitlines()
     tags=[]; units={}; record_type=None
     for line in lines:
@@ -528,28 +528,35 @@ def parse_process_report(pages):
         long_df["Step status"]=long_df["Step status"].fillna("").astype(str).str.strip()
     return wide,long_df,pd.DataFrame(events),pd.DataFrame(alarms)
 
-def repair_missing_decimal_points(long_df):
-    """Repair clear OCR decimal-loss outliers from temperature/pressure series.
-
+def repair_missing_decimal_points(long_df, user_corrections=None):
+    \"\"\"Repair clear OCR decimal-loss outliers and apply user manual corrections.
+    
     The current reading is excluded from the local reference. Decimal candidates
     value/10, value/100 and value/1000 are tested. A change is accepted only
     when the candidate agrees closely with neighboring readings and improves
     the local error by at least 90%. Weight/load-cell readings are excluded.
-    """
+    
+    Any provided user corrections are applied sequentially.
+    \"\"\"
     if long_df is None or long_df.empty or "Value" not in long_df.columns:
         return long_df
     out=long_df.copy()
     out["Value"]=pd.to_numeric(out["Value"],errors="coerce")
     out["OCR original value"]=out["Value"]
     out["OCR decimal repaired"]=False
+    
+    # 1. Automatic OCR repair for missing decimals
     for tag,idx in out.sort_values("Date time").groupby("Instrument tag",sort=False).groups.items():
         upper=str(tag).upper()
         compact=re.sub(r"[^A-Z0-9]","",upper)
         is_weight=("WICR" in upper or upper.startswith("LSICR"))
         is_temp=(upper.startswith(("TICR","TT-")) or re.search(r"CV[45]TT0*1$",compact))
         is_pressure=(upper.startswith(("PICR","PT-")) or re.search(r"CV[45]PT0*1$",compact))
-        if is_weight or not (is_temp or is_pressure):
+        
+        # Skip automatic repair for load cells
+        if is_weight: 
             continue
+            
         ordered=list(idx)
         vals=pd.to_numeric(out.loc[ordered,"Value"],errors="coerce")
         # Neighbor-only reference prevents the malformed value from masking itself.
@@ -559,18 +566,32 @@ def repair_missing_decimal_points(long_df):
         for row_i,current,reference in zip(ordered,vals,ref):
             if pd.isna(current) or pd.isna(reference) or abs(reference)<0.01:
                 continue
-            candidates=[current/10.0,current/100.0,current/1000.0]
+            
+            # Check 10, 100, 1000 divisors
+            candidates=[current/10.0, current/100.0, current/1000.0]
             best=min(candidates,key=lambda x:abs(x-reference))
             old_error=abs(current-reference)
             new_error=abs(best-reference)
             tolerance=max(0.25,0.08*abs(reference))
+            
+            # If the current value is huge compared to reference (missing decimal), and the repaired 
+            # version is extremely close to the reference, accept the fix.
             if abs(current)>=8*abs(reference) and new_error<=tolerance and new_error<=0.10*old_error:
                 out.at[row_i,"Value"]=round(best,6)
                 out.at[row_i,"OCR decimal repaired"]=True
+
+    # 2. Apply explicit user manual corrections if provided
+    if user_corrections is not None and not user_corrections.empty:
+        for idx, row in user_corrections.iterrows():
+            mask = (out["Date time"] == row["Date time"]) & (out["Instrument tag"] == row["Instrument tag"]) & (out["Source report"] == row["Source report"])
+            if mask.any():
+                out.loc[mask, "Value"] = float(row["Corrected value"])
+                out.loc[mask, "OCR decimal repaired"] = True
+
     return out
 
 def extract_pdf_pages_ocr(raw: bytes, first_page=1, last_page=None):
-    """Low-CPU, single-pass, page-at-a-time OCR for scanned legacy reports."""
+    \"\"\"Low-CPU, single-pass, page-at-a-time OCR for scanned legacy reports.\"\"\"
     started=time.perf_counter()
     if not shutil.which("pdftoppm") or not shutil.which("tesseract"):
         raise RuntimeError("Legacy OCR requires poppler-utils and tesseract-ocr in packages.txt.")
@@ -616,8 +637,7 @@ LEGACY_STEP_NAME_MAP = {
     "CV-04 AGITATION": "CV-04 AGITATION",
     "CV-04 API DISPERSION": "CV-04 API DISPERSION",
     "CV-04 CHARGE PLGA USING N2": "CV-04 CHARGE PLGA USING N2",
-    "CV-04 CHECKS": "CV-04 CHECKS",
-    "CV-04 PRESSURIZATION": "CV-04 PRESSURIZATION",
+    "CV-04 CHECKS": "CV-04 PRESSURIZATION": "CV-04 PRESSURIZATION",
     "CV-04 TRANSFER API SOLUTION TO CV-04": "CV-04 TRANSFER API SOLUTION TO CV-04",
     "CV-05 TC & N2 BLANKETING HOLD TIME": "CV-05 TC & N2 BLANKETING HOLD TIME",
     "CYCLE HOLD": "CYCLE HOLD", "HOLD TIME": "HOLD TIME",
@@ -639,7 +659,7 @@ def correct_legacy_step_name(value):
     return LEGACY_STEP_NAME_MAP.get(upper,cleaned.strip(" |.,"))
 
 def parse_legacy_cv_report(pages, source_page_offset=0):
-    """Parse scanned CV4/CV5 process tables while preserving every source-column position."""
+    \"\"\"Parse scanned CV4/CV5 process tables while preserving every source-column position.\"\"\"
     target={"CV4WICR-01","CV4TT-01","CV4PT-01","CV5WICR-01","CV5TT-01","CV5PT-01"}
     unit_map={"WICR":"Kg","TT":"°C","PT":"bar","AG":"rpm"}
     long_rows=[]; groups={}; inventory=[]
@@ -709,7 +729,7 @@ def parse_legacy_cv_report(pages, source_page_offset=0):
     return groups,long_df,pd.DataFrame(),pd.DataFrame(),inv
 
 def detect_report_type(pages):
-    """Automatically classify supported PDF layouts using multiple independent markers."""
+    \"\"\"Automatically classify supported PDF layouts using multiple independent markers.\"\"\"
     probe="\n".join(pages[:6])
     normalized=re.sub(r"\s+", " ", probe).upper()
 
@@ -737,7 +757,7 @@ def detect_report_type(pages):
     return "Unknown", adam_score, omca_score, adam_markers, omca_markers
 
 def parse_omca_anfd_report(pages):
-    """Parse OMCA ANFDA/ANFD-2 reports with sequence + time-only rows."""
+    \"\"\"Parse OMCA ANFDA/ANFD-2 reports with sequence + time-only rows.\"\"\"
     text="\n".join(pages[:3])
     start_match=re.search(r"START DATE\s*&?TIME\s*:?\s*(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2}:\d{2})",text,re.I)
     if not start_match:
@@ -778,7 +798,7 @@ def parse_omca_anfd_report(pages):
 
 
 def build_cross_batch_wide(valid_reports):
-    """Reconstruct one wide process table per uploaded report."""
+    \"\"\"Reconstruct one wide process table per uploaded report.\"\"\"
     frames = []
     for item in valid_reports:
         d = item.get("long_df", pd.DataFrame()).copy()
@@ -800,7 +820,7 @@ def build_cross_batch_wide(valid_reports):
 
 
 def make_step_elapsed_profile(wide_df, selected_steps):
-    """Align every contiguous step occurrence at elapsed time zero."""
+    \"\"\"Align every contiguous step occurrence at elapsed time zero.\"\"\"
     parts = []
     for report, g in wide_df.groupby("Source report", sort=False):
         g = g.sort_values("Date time").copy()
@@ -818,11 +838,11 @@ def make_step_elapsed_profile(wide_df, selected_steps):
     return pd.concat(parts, ignore_index=True, sort=False) if parts else pd.DataFrame()
 
 def identify_process_sequences(data, start_step, end_step, max_duration_minutes=180):
-    """Pair each start-step occurrence with the next end-step occurrence.
+    \"\"\"Pair each start-step occurrence with the next end-step occurrence.
 
     The returned rows include every process status between the two boundaries,
     which creates the requested continuous profile rather than sparse selected-step lines.
-    """
+    \"\"\"
     d=data.sort_values("Date time").copy()
     if d.empty:
         return []
@@ -857,7 +877,7 @@ def identify_process_sequences(data, start_step, end_step, max_duration_minutes=
     return sequences
 
 def identify_profile_windows(data, selected_steps, gap_minutes=10):
-    """Split matching process records into contiguous chronological windows."""
+    \"\"\"Split matching process records into contiguous chronological windows.\"\"\"
     d=data[data["Step status"].astype(str).isin(selected_steps)].sort_values("Date time").copy()
     if d.empty:
         return d, []
@@ -878,7 +898,7 @@ def identify_profile_windows(data, selected_steps, gap_minutes=10):
     return d,options
 
 def normalize_step_name(value):
-    """Normalize report step names so hyphens/spaces do not prevent matching."""
+    \"\"\"Normalize report step names so hyphens/spaces do not prevent matching.\"\"\"
     return re.sub(r"[^A-Z0-9]+", "", str(value or "").upper())
 
 
@@ -893,12 +913,12 @@ def add_target_step_highlight(
     band_opacity=0.12,
     show_band=True,
 ):
-    """Overlay a bold line and optional vertical band for one process step.
+    \"\"\"Overlay a bold line and optional vertical band for one process step.
 
     A separate highlighted segment is drawn for every batch and selected sensor.
     This is suitable for cross-batch plots because each batch can enter the
     target step at a different elapsed time.
-    """
+    \"\"\"
     if profile is None or profile.empty or not target_step:
         return fig
     required={"Batch","Step status",x_column}
@@ -966,11 +986,11 @@ def add_target_step_highlight(
     return fig
 
 def build_multi_sensor_profile(profile, tags, title=None, y_ranges=None, highlight_step=None, highlight_color="#FFC000", highlight_opacity=0.12, show_highlight_band=True):
-    """Overlay multiple selected sensors in one interactive graph.
+    \"\"\"Overlay multiple selected sensors in one interactive graph.
 
     Sensors are assigned to separate Y-axis families so weight, temperature,
     and pressure can be viewed together without forcing a common scale.
-    """
+    \"\"\"
     if profile.empty or not tags:
         return go.Figure()
     y_ranges=y_ranges or {}
@@ -1122,7 +1142,7 @@ def build_multi_sensor_profile(profile, tags, title=None, y_ranges=None, highlig
     return fig
 
 def build_cross_batch_sensor_profile(profile, tags, title, y_ranges=None, highlight_step=None, highlight_color="#FFC000", highlight_opacity=0.12, show_highlight_band=True):
-    """Overlay selected batches with elapsed minutes below and actual date/time above."""
+    \"\"\"Overlay selected batches with elapsed minutes below and actual date/time above.\"\"\"
     if profile.empty or not tags:
         return go.Figure()
     y_ranges=y_ranges or {}
@@ -1193,7 +1213,7 @@ def build_cross_batch_sensor_profile(profile, tags, title, y_ranges=None, highli
     return fig
 
 def build_single_sensor_profile(profile, tag, title=None, y_range=None, highlight_step=None, highlight_color="#FFC000", highlight_opacity=0.12, show_highlight_band=True):
-    """Plot one sensor from sequence start to end with process-step highlighting."""
+    \"\"\"Plot one sensor from sequence start to end with process-step highlighting.\"\"\"
     if profile.empty or tag not in profile.columns:
         return go.Figure()
     d=profile.sort_values("Date time").copy()
@@ -1280,7 +1300,7 @@ def build_single_sensor_profile(profile, tag, title=None, y_range=None, highligh
 
 
 def apply_plot_font_sizes(fig):
-    """Apply sidebar-selected font sizes to every Plotly chart."""
+    \"\"\"Apply sidebar-selected font sizes to every Plotly chart.\"\"\"
     fig.update_layout(
         font=dict(size=plot_tick_font),
         title_font=dict(size=plot_title_font),
@@ -1292,7 +1312,7 @@ def apply_plot_font_sizes(fig):
     return fig
 
 def apply_editable_axis_titles(fig, plot_title, bottom_x_title, top_x_title, family_titles, legend_title=None):
-    """Apply user-entered titles to existing Plotly axes without changing data."""
+    \"\"\"Apply user-entered titles to existing Plotly axes without changing data.\"\"\"
     fig.update_layout(title_text=plot_title)
     fig.update_xaxes(title_text=bottom_x_title, row=None, col=None)
     if "xaxis2" in fig.layout:
@@ -1313,16 +1333,27 @@ def apply_editable_axis_titles(fig, plot_title, bottom_x_title, top_x_title, fam
     return fig
 
 def show_plot_with_downloads(fig, chart_key, file_stem, height=None):
-    """Display a Plotly chart with browser-side PNG and HTML downloads.
+    \"\"\"Display a Plotly chart with browser-side PNG and HTML downloads.
 
     PNG uses Plotly's camera button in the chart toolbar. This runs in the
     user's browser and does not require Kaleido, Chrome, or server memory.
-    """
+    \"\"\"
     if height:
         fig.update_layout(height=height)
     fig=apply_plot_font_sizes(fig)
     safe_name=re.sub(r"[^A-Za-z0-9_-]+", "_", str(file_stem)).strip("_") or "plot"
+    
+    # NEW CONFIG ADDITION: Interactive direct HTML editing for Title, Axes, and Legends
     plot_config={
+        "editable": True,
+        "edits": {
+            "titleText": True,
+            "axisTitleText": True,
+            "legendText": True,
+            "legendPosition": True,
+            "annotationText": True,
+            "colorbarTitleText": True
+        },
         "displaylogo": False,
         "responsive": True,
         "scrollZoom": True,
@@ -1338,7 +1369,7 @@ def show_plot_with_downloads(fig, chart_key, file_stem, height=None):
         },
     }
     st.plotly_chart(fig, width="stretch", key=chart_key, config=plot_config)
-    st.caption("Interactive: hover for values, drag to zoom, mouse wheel to zoom, double-click to reset, use the 10m/30m/1h/All buttons. Camera icon downloads PNG.")
+    st.caption("Interactive: hover for values, drag to zoom, mouse wheel to zoom, double-click to reset. **Click on titles, axis labels, or legend names to edit them directly.** Camera icon downloads PNG.")
     html_bytes=fig.to_html(full_html=True, include_plotlyjs=True, config=plot_config).encode("utf-8")
     st.download_button(
         "Download interactive HTML",
@@ -1385,9 +1416,27 @@ def safe_table(df,height=650,max_rows=3000,key=None):
         elif str(view[c].dtype) in ("object","category"): view[c]=view[c].astype(str).replace("nan","")
     st.dataframe(view,width="stretch",hide_index=True,height=height,row_height=31,key=key)
 
+
+# Initialize Session State for Manual Corrections
+if "manual_corrections" not in st.session_state:
+    st.session_state["manual_corrections"] = pd.DataFrame(columns=["Source report", "Instrument tag", "Date time", "Corrected value"])
+
 st.title("Universal ADAM and OMCA ANFDA Multi-Report Extractor")
-st.caption("Build: INTERACTIVE-MULTI-SENSOR-v33 | Robust missing-decimal OCR repair")
+st.caption("Build: INTERACTIVE-MULTI-SENSOR-v35 | Manual Correction Fix")
 st.caption("Fast extraction uses Poppler pdftotext, then applies the selected ADAM or OMCA parser. Multiple reports are supported without automatic detection delay.")
+
+# Add Manual Correction UI to sidebar
+st.sidebar.subheader("Manual OCR Data Correction")
+st.sidebar.caption("If a decimal point issue persists (e.g., 6.50 extracted as 650), you can manually fix it here. Select the report, tag, and time, then enter the correct value.")
+
+# Display existing corrections
+if not st.session_state["manual_corrections"].empty:
+    with st.sidebar.expander("Active Manual Corrections"):
+        st.dataframe(st.session_state["manual_corrections"], hide_index=True, use_container_width=True)
+        if st.button("Clear All Corrections"):
+            st.session_state["manual_corrections"] = pd.DataFrame(columns=["Source report", "Instrument tag", "Date time", "Corrected value"])
+            st.rerun()
+
 uploads=st.sidebar.file_uploader(
     "Upload multiple report PDFs",
     type=["pdf"],
@@ -1446,8 +1495,9 @@ for idx,uploaded in enumerate(uploads):
         legacy_page_range_by_file[uploaded.name]=(int(first_page),int(last_page))
     else:
         legacy_page_range_by_file[uploaded.name]=(1,None)
+        
 @st.cache_data(show_spinner=False, max_entries=2, ttl=1800)
-def process_uploaded_report(file_name, raw, selected_type, first_page=1, last_page=None, parser_version="legacy-cv-v6-low-cpu-step-correction"):
+def process_uploaded_report(file_name, raw, selected_type, first_page=1, last_page=None, parser_version="legacy-cv-v6-low-cpu-step-correction", user_corrections_df=None):
     if selected_type=="Legacy CV4/CV5 Process Report (OCR)":
         pages,extraction_engine,text_extraction_seconds=extract_pdf_pages_ocr(raw,first_page,last_page)
     else:
@@ -1464,7 +1514,7 @@ def process_uploaded_report(file_name, raw, selected_type, first_page=1, last_pa
         groups,long_df,events,alarms=parse_omca_anfd_report(pages)
     elif selected_type=="Legacy CV4/CV5 Process Report (OCR)":
         groups,long_df,events,alarms,tag_inventory=parse_legacy_cv_report(pages,int(first_page)-1)
-        long_df=repair_missing_decimal_points(long_df)
+        long_df=repair_missing_decimal_points(long_df, user_corrections=user_corrections_df)
     else:
         error="Select a valid report type."
     if error is None and long_df.empty:
@@ -1507,7 +1557,9 @@ if process_now:
             first_page,last_page=legacy_page_range_by_file.get(uploaded.name,(1,None))
             if selected_type=="Legacy CV4/CV5 Process Report (OCR)" and last_page is not None and last_page<first_page:
                 raise ValueError(f"End page ({last_page}) must be greater than or equal to start page ({first_page}) for {uploaded.name}.")
-            reports.append(process_uploaded_report(uploaded.name,uploaded.getvalue(),selected_type,first_page,last_page,"legacy-cv-v7-per-file-page-range"))
+            # Pass user corrections for this specific file
+            file_corrections = st.session_state["manual_corrections"][st.session_state["manual_corrections"]["Source report"] == uploaded.name]
+            reports.append(process_uploaded_report(uploaded.name,uploaded.getvalue(),selected_type,first_page,last_page,"legacy-cv-v7-per-file-page-range", file_corrections))
         except Exception as exc:
             reports.append({"file_name":uploaded.name,"detected_type":"Failed","error":f"{type(exc).__name__}: {exc}","long_df":pd.DataFrame(),"events":pd.DataFrame(),"alarms":pd.DataFrame(),"groups":{},"meta":{"File name":uploaded.name},"adam_score":0,"omca_score":0})
         gc.collect()
@@ -1669,6 +1721,44 @@ with tabs[2]:
     if cross_wide.empty:
         st.info("Process at least one ADAM Process report to create sensor profiles.")
     else:
+        # ---- UI Addition: Manual Form entry in Profile Tab ----
+        with st.expander("🛠️ Add Manual OCR Correction", expanded=False):
+            st.markdown("If you notice a spike/drop caused by OCR missing a decimal point (e.g. 6.50 extracted as 650), manually correct it here.")
+            corr_col1, corr_col2, corr_col3 = st.columns(3)
+            with corr_col1:
+                man_report = st.selectbox("Source Report", report_names, key="man_corr_report")
+            with corr_col2:
+                available_tags = []
+                # Fetch available tags for the selected report
+                if not cross_wide.empty:
+                    available_tags = cross_wide[cross_wide["Source report"] == man_report].columns.drop(["Source report", "Batch", "Date time", "Step status"], errors='ignore').tolist()
+                man_tag = st.selectbox("Instrument Tag", sorted(available_tags) if available_tags else [selected_tag], key="man_corr_tag")
+            with corr_col3:
+                # Provide an initial value to the time input to avoid empty errors
+                available_times = []
+                if not cross_wide.empty and man_tag:
+                   rep_data = cross_wide[cross_wide["Source report"] == man_report]
+                   available_times = rep_data["Date time"].dt.strftime("%d-%m-%Y %H:%M:%S").tolist()
+                   
+                man_time = st.selectbox("Select exact Timestamp", available_times, key="man_corr_time")
+            
+            man_val = st.number_input("Corrected Value", format="%.3f", key="man_corr_val")
+            if st.button("Apply Correction & Reprocess", type="primary"):
+                try:
+                    parsed_time = pd.to_datetime(man_time, format="%d-%m-%Y %H:%M:%S")
+                    new_correction = pd.DataFrame([{
+                        "Source report": man_report,
+                        "Instrument tag": man_tag,
+                        "Date time": parsed_time,
+                        "Corrected value": man_val
+                    }])
+                    st.session_state["manual_corrections"] = pd.concat([st.session_state["manual_corrections"], new_correction], ignore_index=True)
+                    st.success("Correction saved! Please click 'Process uploaded reports' again in the sidebar to apply the changes to the extracted data.")
+                except Exception as e:
+                    st.error(f"Failed to add correction: {e}")
+        st.divider()
+        # ---- End of manual form ----
+
         available_batches=sorted(x for x in cross_wide["Batch"].dropna().astype(str).unique() if x.strip())
         selected_batches=st.multiselect(
             "Batch numbers",
@@ -1981,8 +2071,6 @@ with tabs[2]:
             )
         with stat_col2:
             # Use the temperature tags selected in the profile controls.
-            # `selected_temp` is defined in this profile block; the previous
-            # variable name `ts` was undefined and caused a NameError.
             default_stat_tags=[
                 x for x in selected_temp
                 if x in available_stat_temp_tags
