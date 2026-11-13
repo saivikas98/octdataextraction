@@ -22,7 +22,7 @@ from pathlib import Path
 
 
 def clear_application_cache():
-    \"\"\"Clear parsed-report caches and temporary selection state.\"\"\"
+    """Clear parsed-report caches and temporary selection state."""
     st.cache_data.clear()
     st.cache_resource.clear()
     for key in list(st.session_state.keys()):
