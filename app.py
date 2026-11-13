@@ -1979,22 +1979,19 @@ with tabs[2]:
                 default_max=observed_max+0.05*span
                 yc1,yc2,yc3=st.columns([1.2,1,1])
                 with yc1:
-                    st.write(f"**{axis_tag}**  
-Observed: {observed_min:.3f} to {observed_max:.3f}")
+                    st.write(f"**{axis_tag}**Observed: {observed_min:.3f} to {observed_max:.3f}")
                 with yc2:
                     selected_y_min=st.number_input(
                         f"{axis_tag} minimum",
                         value=float(default_min),
                         format="%.3f",
-                        key=f"y_min_{axis_tag}_v12",
-                    )
+                        key=f"y_min_{axis_tag}_v12",)
                 with yc3:
                     selected_y_max=st.number_input(
                         f"{axis_tag} maximum",
                         value=float(default_max),
                         format="%.3f",
-                        key=f"y_max_{axis_tag}_v12",
-                    )
+                        key=f"y_max_{axis_tag}_v12",)
                 if selected_y_max<=selected_y_min:
                     st.warning(f"{axis_tag}: maximum must be greater than minimum. Automatic scaling will be used for this tag.")
                 else:
